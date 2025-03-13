@@ -17,7 +17,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
-from megatron.core.transformer.utils import TransformerLayerSubmoduleCallables, SubmoduleCallables
+from megatron.core.transformer.utils import TransformerLayerSubmoduleCallables, SubmoduleCallables, SubmoduleStates
 # from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllPerBatchState, per_batch_state_context
 
 def get_transformer_layer_offset(config: TransformerConfig):
@@ -675,7 +675,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     def _submodule_identity_backward(self, *args):
         pass
 
-    def get_submodule_callables(self):
+    def get_submodule_callables(
+        self,
+        submodule_states: SubmoduleStates
+    ):
         """
         Returns a dictionary of submodule callables for the transformer layer.
         """
@@ -686,6 +689,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             return default_func
 
         attention_func = get_func_with_default(self._submodule_attention_router_compound_forward, self._submodule_attention_forward)
+        attention_func = partial(attention_func, **submodule_states.get_dict())
         attention_backward_func = get_func_with_default(self._submodule_attention_router_compound_backward, self._submodule_attention_backward)
         dispatch_func = get_func_with_default(self._submodule_dispatch_forward, self._submodule_identity_forward)
         dispatch_backward_func = get_func_with_default(self._submodule_dispatch_backward, self._submodule_identity_backward)
@@ -723,6 +727,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 forward=partial(self._callable_wrapper, True, post_combine_func),
                 backward=partial(self._callable_wrapper, False, post_combine_backward_func),
             ),
+            state=submodule_states,
         )
         return callables
 

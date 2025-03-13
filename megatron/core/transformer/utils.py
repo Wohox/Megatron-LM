@@ -200,6 +200,29 @@ class SubmoduleCallables:
     dw: Optional[Callable] = None
 
 @dataclass
+class SubmoduleStates:
+    attention_mask=None,
+    inference_params=None
+    rotary_pos_emb=None
+    rotary_pos_cos=None
+    rotary_pos_sin=None
+    attention_bias=None
+    packed_seq_params=None
+    sequence_len_offset=None
+    
+    def get_dict(self):
+        return {
+            'attention_mask': self.attention_mask,
+            'inference_params': self.inference_params,
+            'rotary_pos_emb': self.rotary_pos_emb,
+            'rotary_pos_cos': self.rotary_pos_cos,
+            'rotary_pos_sin': self.rotary_pos_sin,
+            'attention_bias': self.attention_bias,
+            'packed_seq_params': self.packed_seq_params,
+            'sequence_len_offset': self.sequence_len_offset,
+        }
+
+@dataclass
 class TransformerLayerSubmoduleCallables:
     """
     Collects the SubmoduleMethods for each of the submodules:
@@ -210,6 +233,10 @@ class TransformerLayerSubmoduleCallables:
     mlp: SubmoduleCallables
     combine: SubmoduleCallables
     post_combine: SubmoduleCallables
+    state: SubmoduleStates
 
     def as_array(self):
         return [self.attention, self.dispatch, self.mlp, self.combine, self.post_combine]
+    
+    def get_state(self):
+        return self.state
