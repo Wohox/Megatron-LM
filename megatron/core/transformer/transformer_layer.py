@@ -618,27 +618,22 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if self.is_deepep_dispatcher():
             assert tokens_per_expert is None, "For DeepEP dispatcher, tokens_per_expert should be None."
             self.mlp.token_dispatcher.set_dispatched_probs(probs)
-            probs = None
             dispatched_input, tokens_per_expert = self.mlp.token_dispatcher.dispatch_postprocess(dispatched_input)
+            probs = self.mlp.token_dispatcher.get_dispatched_probs()
         else:
             self.mlp.token_dispatcher.probs = probs
             dispatched_input = self.mlp.token_dispatcher.dispatch_postprocess(dispatched_input)
         expert_output, mlp_bias = self.mlp.experts(dispatched_input, tokens_per_expert)
-        if self.is_deepep_dispatcher():
-            expert_output = self.mlp.token_dispatcher._comm_manager.get_restored_hidden_states_by_experts(expert_output)
-        else:
-            expert_output = self.mlp.token_dispatcher.combine_preprocess(expert_output)
         if self.mlp.use_shared_expert and not self.mlp.shared_expert_overlap:
             shared_expert_output = self.mlp.shared_experts(hidden_states)
         return expert_output, shared_expert_output, probs, mlp_bias
 
     def _submodule_combine_forward(self, output, shared_expert_output, mlp_bias, probs, residual):
         if self.is_deepep_dispatcher():
-            output = self.mlp.token_dispatcher._comm_manager.combine(output).view(self.mlp.token_dispatcher.hidden_shape)
+            self.mlp.token_dispatcher.set_dispatched_probs(probs)
         else:
             self.mlp.token_dispatcher.probs = probs
-            output = self.mlp.token_dispatcher.combine_all_to_all(output)
-            output = self.mlp.token_dispatcher.combine_postprocess(output)
+        output,_ = self.mlp.token_dispatcher.token_unpermutation(output, None)
         if shared_expert_output is not None:
             output = output + shared_expert_output
         mlp_output_with_bias = (output, mlp_bias)

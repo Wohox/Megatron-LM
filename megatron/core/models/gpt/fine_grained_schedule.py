@@ -271,10 +271,7 @@ class MoeMlPNode(TransformerLayerNode):
                 )
             assert mlp_bias is None
 
-        if self.layer.is_deepep_dispatcher():
-            self.common_state.probs = None
-        else:
-            self.common_state.probs = self.detach(probs)
+        self.common_state.probs = self.detach(probs)
         # pre_mlp_layernorm_output  used
         self.common_state.pre_mlp_layernorm_output = None
         return expert_output, shared_expert_output
@@ -290,6 +287,9 @@ class MoeCombineNode(TransformerLayerNode):
         token_dispatcher = self.layer.mlp.token_dispatcher
         residual = self.common_state.residual
         probs = self.common_state.probs
+        cur_stream = torch.cuda.current_stream()
+        self.common_state.residual.record_stream(cur_stream)
+        self.common_state.probs.record_stream(cur_stream)
         with token_dispatcher.per_batch_state_context(self.common_state):
             # release tensor not used by backward
             output = self.layer._submodule_combine_forward(
@@ -299,10 +299,6 @@ class MoeCombineNode(TransformerLayerNode):
                 probs, 
                 residual
             )
-        cur_stream = torch.cuda.current_stream()
-        self.common_state.residual.record_stream(cur_stream)
-        if self.common_state.probs is not None:
-            self.common_state.probs.record_stream(cur_stream)
         self.common_state.residual = None
         self.common_state.probs = None
         return output
@@ -372,11 +368,11 @@ def build_layer_schedule_plan(layer, event, chunk_state, comp_stream, com_stream
         common_state = TransformerLayerState()
     attn = MoeAttnNode(chunk_state, common_state, layer, comp_stream, event)
     attn.name = "attn"
-    dispatch = MoeDispatchNode(chunk_state, common_state, layer, com_stream, event, True)
+    dispatch = MoeDispatchNode(chunk_state, common_state, layer, com_stream, event, False)
     dispatch.name = "dispatch"
-    mlp = MoeMlPNode(chunk_state, common_state, layer, comp_stream, event, True)
+    mlp = MoeMlPNode(chunk_state, common_state, layer, comp_stream, event, False)
     mlp.name = "mlp"
-    combine = MoeCombineNode(chunk_state, common_state, layer, com_stream, event, True)
+    combine = MoeCombineNode(chunk_state, common_state, layer, com_stream, event, False)
     combine.name = "combine"
     return TransformerLayerSchedulePlan(attn, dispatch, mlp, combine)
 
