@@ -15,9 +15,16 @@ from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model, make_viewless_tensor
 
 
+cur=0
 # Types
 Shape = Union[List[int], torch.Size]
 
+def print_rank(msg, rank=0):
+    global cur
+    return
+    if cur > 0:
+        if torch.distributed.get_rank() == rank:
+            print(msg)
 
 def make_viewless(e):
     """make_viewless util func"""
@@ -56,6 +63,20 @@ class ScheduleNode:
         self.outputs = None
 
     def default_backward_func(self, outputs, output_grad):
+        def remove_none(res_ori, res_grad_ori):
+            res = []
+            res_grad = []
+            for i in range(len(res_ori)):
+                if res_ori[i] is not None and res_grad_ori[i] is not None:
+                    res.append(res_ori[i])
+                    res_grad.append(res_grad_ori[i])
+            return tuple(res), tuple(res_grad)
+        global cur
+        print_rank(f"[debug] [{torch.distributed.get_rank()}] backward {self.name}, iter {cur}", 6)
+        for i in range(len(outputs)):
+            print_rank(f"[debug] {self.name} backward outputs/output_grad, iter {cur} grad: {output_grad[len(outputs)-i-1]}", 6)
+            print_rank(f"[debug] {self.name} backward outputs/output_grad, iter {cur} output: {outputs[len(outputs)-i-1]}", 6)
+        outputs, output_grad = remove_none(outputs, output_grad)
         Variable._execution_engine.run_backward(
             tensors=outputs,
             grad_tensors=output_grad,
@@ -72,9 +93,21 @@ class ScheduleNode:
 
         if not isinstance(inputs, tuple):
             inputs = (inputs,)
+        if self.name in [
+                # "attn", 
+                # "dispatch", 
+                # "mlp", 
+                # "combine", 
+                # "pre_process", "post_process"
+            ]:
+            torch.cuda.synchronize()
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
+        global cur
+        print_rank(f"[debug] [{torch.distributed.get_rank()}] forward {self.name}, iter {cur}", 6)
+        print_rank(f"[debug] forward inputs, iter {cur}: {inputs}", 6)
+        cur+=1
         with stream_acquire_context(self.stream, self.event):
             torch.cuda.nvtx.range_push(f"{self.name} forward")
             with torch.cuda.stream(self.stream):
@@ -87,17 +120,21 @@ class ScheduleNode:
                 data = self.forward_func(*data)
 
                 if not isinstance(data, tuple):
-                    data = make_viewless(data)
+                    if data is not None:
+                        data = make_viewless(data)
                 else:
                     data = tuple([make_viewless(e) if isinstance(e, Tensor) else e for e in data])
 
                 self.output = data
             torch.cuda.nvtx.range_pop()
 
+        for input in inputs:
+            if input is not None:
+                input.record_stream(self.stream)
         if self.free_inputs:
             for input in inputs:
-                input.record_stream(self.stream)
-                input.untyped_storage().resize_(0)
+                if input is not None:
+                    input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -129,7 +166,8 @@ class ScheduleNode:
 
         # output_grad maybe from another stream
         for g in output_grad:
-            g.record_stream(self.stream)
+            if g is not None:
+                g.record_stream(self.stream)
 
         return self.get_grad()
 

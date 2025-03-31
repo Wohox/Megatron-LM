@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
+from dataclasses import dataclass
 import torch
 
 from megatron.core.parallel_state import (
@@ -946,8 +947,10 @@ class _DeepepManager(_DispatchManager):
         )
         return hidden_states
 
+@dataclass
 class MoEFlexPerBatchState:
-    pass
+    token_probs: torch.Tensor=None
+    dispatched_probs: torch.Tensor=None
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """
@@ -979,14 +982,23 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         )
 
     def collect_per_batch_state(self, state: MoEFlexPerBatchState):
-        pass
+        state.token_probs = getattr(self._comm_manager, "token_probs", None)
+        state.dispatched_probs = getattr(self._comm_manager, "dispatched_probs", None)
 
     def apply_per_batch_state(self, state: MoEFlexPerBatchState):
-        pass
-
+        self._comm_manager.token_probs = state.token_probs
+        self._comm_manager.dispatched_probs = state.dispatched_probs
+    
     @contextmanager
     def per_batch_state_context(self, state: MoEFlexPerBatchState):
-        yield
+        origin_state = MoEFlexPerBatchState()
+        self.collect_per_batch_state(origin_state)
+        try:
+            self.apply_per_batch_state(state)
+            yield
+        finally:
+            self.collect_per_batch_state(state)
+            self.apply_per_batch_state(origin_state)
 
     def set_shared_experts(self, shared_experts):
         raise NotImplementedError(
