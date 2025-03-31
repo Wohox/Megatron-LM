@@ -189,6 +189,7 @@ class MoeAttnNode(TransformerLayerNode):
         sequence_len_offset = self.chunk_state.sequence_len_offset
 
         token_dispatcher = self.layer.mlp.token_dispatcher
+        local_tokens = None
         with token_dispatcher.per_batch_state_context(self.common_state):
             if not self.layer.is_deepep_dispatcher():
                 (
@@ -196,7 +197,6 @@ class MoeAttnNode(TransformerLayerNode):
                     pre_mlp_layernorm_output,
                     tokens_per_expert,
                     local_tokens,
-                    probs,
                 ) = self.layer._submodule_attention_router_compound_forward(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -211,9 +211,7 @@ class MoeAttnNode(TransformerLayerNode):
             else:
                 (
                     hidden_states, 
-                    pre_mlp_layernorm_output, 
-                    local_tokens, 
-                    probs
+                    pre_mlp_layernorm_output,  # pre_mlp_layernorm_output
                 ) = self.layer._submodule_attention_router_compound_forward(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -227,12 +225,14 @@ class MoeAttnNode(TransformerLayerNode):
                 )
         
         # detached here
-        if not self.layer.is_deepep_dispatcher():
+        if self.layer.is_deepep_dispatcher():
+            self.common_state.token_probs = self.detach(self.common_state.token_probs)
+        else:
             self.common_state.tokens_per_expert = tokens_per_expert
-        self.common_state.probs = self.detach(probs)
-        self.common_state.residual = self.detach(hidden_states)
+            self.common_state.probs = self.detach(self.common_state.probs)
         self.common_state.pre_mlp_layernorm_output = self.detach(pre_mlp_layernorm_output)
-
+        self.common_state.residual = self.detach(hidden_states)
+            
         return local_tokens
 
     def dw(self):
@@ -244,37 +244,32 @@ class MoeDispatchNode(TransformerLayerNode):
 
     def forward_impl(self, permutated_local_input_tokens):
         token_dispatcher = self.layer.mlp.token_dispatcher
-        probs = self.common_state.probs
         with token_dispatcher.per_batch_state_context(self.common_state):
             if self.layer.is_deepep_dispatcher():
-                dispatched_input, probs = self.layer._submodule_dispatch_forward(permutated_local_input_tokens, probs)
+                assert permutated_local_input_tokens is None
+                dispatched_input = self.layer._submodule_dispatch_forward(self.common_state.pre_mlp_layernorm_output)
             else:
                 dispatched_input = self.layer._submodule_dispatch_forward(permutated_local_input_tokens)
         if self.layer.is_deepep_dispatcher():
-            self.common_state.probs = self.detach(probs)
+            self.common_state.dispatched_probs = self.detach(self.common_state.dispatched_probs)
         return dispatched_input
 
 
 class MoeMlPNode(TransformerLayerNode):
     def forward_impl(self, dispatched_input):
         pre_mlp_layernorm_output = self.common_state.pre_mlp_layernorm_output
-        probs = self.common_state.probs
+        tokens_per_expert = getattr(self.common_state, "tokens_per_expert", None)
         token_dispatcher = self.layer.mlp.token_dispatcher
         with token_dispatcher.per_batch_state_context(self.common_state):
-            if self.layer.is_deepep_dispatcher():
-                expert_output, shared_expert_output, _, mlp_bias = self.layer._submodule_moe_forward(
-                    dispatched_input, pre_mlp_layernorm_output, probs,
-                )
-            else:
-                expert_output, shared_expert_output, probs, mlp_bias = self.layer._submodule_moe_forward(
-                    dispatched_input, pre_mlp_layernorm_output, probs, self.common_state.tokens_per_expert,
-                )
+            expert_output, shared_expert_output, mlp_bias = self.layer._submodule_moe_forward(
+                dispatched_input, pre_mlp_layernorm_output, tokens_per_expert,
+            )
             assert mlp_bias is None
 
         if self.layer.is_deepep_dispatcher():
-            self.common_state.probs = None
+            self.common_state.dispatched_probs = self.detach(self.common_state.dispatched_probs)
         else:
-            self.common_state.probs = self.detach(probs)
+            self.common_state.probs = self.detach(self.common_state.probs)
         # pre_mlp_layernorm_output  used
         self.common_state.pre_mlp_layernorm_output = None
         return expert_output, shared_expert_output
@@ -289,22 +284,26 @@ class MoeCombineNode(TransformerLayerNode):
         # TODO(lhb): if dw use grad of residual and probs, necessary synchronization should be add
         token_dispatcher = self.layer.mlp.token_dispatcher
         residual = self.common_state.residual
-        probs = self.common_state.probs
+        cur_stream = torch.cuda.current_stream()
         with token_dispatcher.per_batch_state_context(self.common_state):
             # release tensor not used by backward
             output = self.layer._submodule_combine_forward(
                 expert_output, 
                 shared_expert_output, 
                 None,
-                probs, 
                 residual
             )
-        cur_stream = torch.cuda.current_stream()
+
         self.common_state.residual.record_stream(cur_stream)
-        if self.common_state.probs is not None:
+        if self.layer.is_deepep_dispatcher():
+            self.common_state.dispatched_probs.record_stream(cur_stream)
+        else:
             self.common_state.probs.record_stream(cur_stream)
         self.common_state.residual = None
         self.common_state.probs = None
+        self.common_state.dispatched_probs = None
+        self.common_state.token_probs = None
+        self.common_state.tokens_per_expert = None
         return output
 
 
@@ -372,11 +371,11 @@ def build_layer_schedule_plan(layer, event, chunk_state, comp_stream, com_stream
         common_state = TransformerLayerState()
     attn = MoeAttnNode(chunk_state, common_state, layer, comp_stream, event)
     attn.name = "attn"
-    dispatch = MoeDispatchNode(chunk_state, common_state, layer, com_stream, event, True)
+    dispatch = MoeDispatchNode(chunk_state, common_state, layer, com_stream, event, False)
     dispatch.name = "dispatch"
-    mlp = MoeMlPNode(chunk_state, common_state, layer, comp_stream, event, True)
+    mlp = MoeMlPNode(chunk_state, common_state, layer, comp_stream, event, False)
     mlp.name = "mlp"
-    combine = MoeCombineNode(chunk_state, common_state, layer, com_stream, event, True)
+    combine = MoeCombineNode(chunk_state, common_state, layer, com_stream, event, False)
     combine.name = "combine"
     return TransformerLayerSchedulePlan(attn, dispatch, mlp, combine)
 
@@ -540,6 +539,8 @@ def schedule_layer_1f1b(
             with f_context:
                 output = f_layer.combine.forward(f_input)
                 return output
+    #TODO @pingtianl: temporarily added to avoid nan in post_process input
+    torch.cuda.synchronize()
 
     def next_iter_pre_backward():
         if b_layer is not None:

@@ -220,7 +220,6 @@ class TransformerLayerSubmoduleCallables:
     dispatch: SubmoduleCallables
     mlp: SubmoduleCallables
     combine: SubmoduleCallables
-    post_combine: SubmoduleCallables
 
     def as_array(self):
-        return [self.attention, self.dispatch, self.mlp, self.combine, self.post_combine]
+        return [self.attention, self.dispatch, self.mlp, self.combine]

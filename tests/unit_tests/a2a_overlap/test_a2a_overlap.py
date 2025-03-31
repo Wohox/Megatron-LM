@@ -14,6 +14,10 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import unwrap_model
 
+def print_rank_0(msg):
+    if torch.distributed.get_rank() == 0:
+        print(msg)
+
 def build_data(args):
     s = args.seq_length
     if args.sequence_parallel:
@@ -182,14 +186,14 @@ def run_model_a2a_overlap_with_capture_deepep(model, input_tensors, microbatches
         comp_stream, events[0],
         deepep_hidden_states, pre_mlp_layernorm_output, probs,
     )
-    expert_output, shared_expert_output, _, mlp_bias = mlp_output
+    expert_output, shared_expert_output, probs, mlp_bias = mlp_output
     mlp_outputs.append(mlp_output)
     mlp_detached_inputs.append(detached_inputs)
     
     # f4. Combine forward
     combine_output, detached_inputs = callables.combine.forward(
         comm_stream, events[0],
-        expert_output, shared_expert_output, mlp_bias, None, hidden_states
+        expert_output, shared_expert_output, mlp_bias, probs, hidden_states
     )
     combine_outputs.append(combine_output)
     combine_detached_inputs.append(detached_inputs)
@@ -214,7 +218,7 @@ def run_model_a2a_overlap_with_capture_deepep(model, input_tensors, microbatches
             tuple([torch.ones_like(combine_outputs[prev_idx][0])*0.01]),
             combine_detached_inputs[prev_idx],
         )   
-        output_grad, shared_expert_output_grad, mlp_bias_grad, _, residual_grad = grads
+        output_grad, shared_expert_output_grad, mlp_bias_grad, probs_grad, residual_grad = grads
         
         # f1. Attention forward for current microbatch
         attention_output, detached_inputs = callables.attention.forward(
@@ -237,7 +241,7 @@ def run_model_a2a_overlap_with_capture_deepep(model, input_tensors, microbatches
         grads = callables.mlp.backward(
             comp_stream, events[prev_idx],
             mlp_outputs[prev_idx], 
-            tuple([output_grad, shared_expert_output_grad, None, mlp_bias_grad]),
+            tuple([output_grad, shared_expert_output_grad, probs_grad, mlp_bias_grad]),
             mlp_detached_inputs[prev_idx],
         )
         dispatched_input_grad, hidden_states_grad, probs_grad = grads
@@ -256,14 +260,14 @@ def run_model_a2a_overlap_with_capture_deepep(model, input_tensors, microbatches
             comp_stream, events[i],
             deepep_hidden_states, pre_mlp_layernorm_output, probs,
         )
-        expert_output, shared_expert_output, _, mlp_bias = mlp_output
+        expert_output, shared_expert_output, probs, mlp_bias = mlp_output
         mlp_outputs.append(mlp_output)
         mlp_detached_inputs.append(detached_inputs)
         
         # f4. Combine forward for current microbatch
         combine_output, detached_inputs = callables.combine.forward(
             comm_stream, events[i],
-            expert_output, shared_expert_output, mlp_bias, None, hidden_states
+            expert_output, shared_expert_output, mlp_bias, probs, hidden_states
         )
         combine_outputs.append(combine_output)
         combine_detached_inputs.append(detached_inputs)
@@ -286,13 +290,13 @@ def run_model_a2a_overlap_with_capture_deepep(model, input_tensors, microbatches
         tuple([torch.ones_like(combine_outputs[microbatches-1][0])*0.01]),
         combine_detached_inputs[microbatches-1],
     )   
-    output_grad, shared_expert_output_grad, mlp_bias_grad, _, residual_grad = grads
+    output_grad, shared_expert_output_grad, mlp_bias_grad, probs_grad, residual_grad = grads
 
     # b2. MLP backward for last microbatch
     grads = callables.mlp.backward(
         comp_stream, events[prev_idx],
         mlp_outputs[microbatches-1], 
-        tuple([output_grad, shared_expert_output_grad, None, mlp_bias_grad]),
+        tuple([output_grad, shared_expert_output_grad, probs_grad, mlp_bias_grad]),
         mlp_detached_inputs[microbatches-1],
     )
     dispatched_input_grad, hidden_states_grad, probs_grad = grads

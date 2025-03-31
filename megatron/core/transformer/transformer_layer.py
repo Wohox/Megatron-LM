@@ -573,27 +573,26 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         probs, routing_map = self.mlp.router(pre_mlp_layernorm_output)
 
         if self.is_deepep_dispatcher():
-            deepep_hidden_states = self.mlp.token_dispatcher.dispatch_preprocess(pre_mlp_layernorm_output, routing_map, probs)
-            return hidden_states, pre_mlp_layernorm_output, deepep_hidden_states, self.mlp.token_dispatcher.get_token_probs()
+            self.mlp.token_dispatcher.hidden_shape = pre_mlp_layernorm_output.shape
+            routing_map, probs = self.mlp.token_dispatcher._initialize_metadata(routing_map, probs)
+            self.mlp.token_dispatcher._comm_manager.setup_metadata(routing_map, probs)
+            return hidden_states, pre_mlp_layernorm_output
         else:
             tokens_per_expert = self.mlp.token_dispatcher.meta_prepare(pre_mlp_layernorm_output, probs, routing_map)
             permutated_local_input_tokens = self.mlp.token_dispatcher.dispatch_preprocess(pre_mlp_layernorm_output, routing_map)
 
-            return hidden_states, pre_mlp_layernorm_output, tokens_per_expert, permutated_local_input_tokens, probs
+            return hidden_states, pre_mlp_layernorm_output, tokens_per_expert, permutated_local_input_tokens
     
     def _submodule_dispatch_forward(self, tokens, probs=None):
         """
         Dispatches tokens to the appropriate experts based on the router output.
         """
         if self.is_deepep_dispatcher():
-            self.mlp.token_dispatcher.set_token_probs(probs)
-            output_tokens = self.mlp.token_dispatcher._comm_manager.dispatch(tokens)
-            probs = self.mlp.token_dispatcher.get_dispatched_probs()
-            return output_tokens, probs
+            output_tokens = self.mlp.token_dispatcher._comm_manager.dispatch(tokens.view(-1, self.mlp.token_dispatcher.hidden_shape[-1]))
         else:
             assert probs is None, "For AlltoAll dispatcher, probs should be None."
             output_tokens = self.mlp.token_dispatcher.dispatch_all_to_all(tokens)
-            return output_tokens
+        return output_tokens
 
     def _submodule_dense_forward(self, hidden_states):
         residual = hidden_states
@@ -609,7 +608,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         return output
     
-    def _submodule_moe_forward(self, dispatched_input, hidden_states, probs, tokens_per_expert=None):
+    def _submodule_moe_forward(self, dispatched_input, hidden_states, tokens_per_expert=None):
         """
         Performs a forward pass for the MLP submodule, including both expert-based
         and optional shared-expert computations.
@@ -617,49 +616,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         shared_expert_output = None
         if self.is_deepep_dispatcher():
             assert tokens_per_expert is None, "For DeepEP dispatcher, tokens_per_expert should be None."
-            self.mlp.token_dispatcher.set_dispatched_probs(probs)
-            probs = None
             dispatched_input, tokens_per_expert = self.mlp.token_dispatcher.dispatch_postprocess(dispatched_input)
         else:
-            self.mlp.token_dispatcher.probs = probs
             dispatched_input = self.mlp.token_dispatcher.dispatch_postprocess(dispatched_input)
         expert_output, mlp_bias = self.mlp.experts(dispatched_input, tokens_per_expert)
-        if self.is_deepep_dispatcher():
-            expert_output = self.mlp.token_dispatcher._comm_manager.get_restored_hidden_states_by_experts(expert_output)
-        else:
-            expert_output = self.mlp.token_dispatcher.combine_preprocess(expert_output)
         if self.mlp.use_shared_expert and not self.mlp.shared_expert_overlap:
             shared_expert_output = self.mlp.shared_experts(hidden_states)
-        return expert_output, shared_expert_output, probs, mlp_bias
+        return expert_output, shared_expert_output, mlp_bias
 
-    def _submodule_combine_forward(self, output, shared_expert_output, mlp_bias, probs, residual):
-        if self.is_deepep_dispatcher():
-            output = self.mlp.token_dispatcher._comm_manager.combine(output).view(self.mlp.token_dispatcher.hidden_shape)
-        else:
-            self.mlp.token_dispatcher.probs = probs
-            output = self.mlp.token_dispatcher.combine_all_to_all(output)
-            output = self.mlp.token_dispatcher.combine_postprocess(output)
-        if shared_expert_output is not None:
-            output = output + shared_expert_output
-        mlp_output_with_bias = (output, mlp_bias)
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.hidden_dropout
-            )
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
-
-        return output
-    
-    def _submodule_post_combine_forward(self, output, shared_expert_output, mlp_bias, probs, residual):
-        """
-        Re-combines the expert outputs (and optional shared_expert_output) into the same order
-        as the original input tokens, applying any required bias.
-        """
-        if not self.is_deepep_dispatcher():
-            self.mlp.token_dispatcher.probs = probs
-            output = self.mlp.token_dispatcher.combine_postprocess(output)
+    def _submodule_combine_forward(self, output, shared_expert_output, mlp_bias, residual):
+        output,_ = self.mlp.token_dispatcher.token_unpermutation(output, None)
         if shared_expert_output is not None:
             output = output + shared_expert_output
         mlp_output_with_bias = (output, mlp_bias)
@@ -738,10 +704,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             combine=SubmoduleCallables(
                 forward=partial(self._callable_wrapper, True, combine_func),
                 backward=partial(self._callable_wrapper, False, self._submodule_custom_backward, nvtx_name="combine_backward"),
-            ),
-            post_combine=SubmoduleCallables(
-                forward=partial(self._callable_wrapper, True, post_combine_func),
-                backward=partial(self._callable_wrapper, False, self._submodule_custom_backward, nvtx_name="post_combine_backward"),
             ),
         )
         return callables
