@@ -659,15 +659,23 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
-        tokens_per_expert = tokens_per_expert.tolist()
-        if self.config.fp8 or self.config.fp4:
-            actual_tokens_per_expert = tokens_per_expert
-            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs.unsqueeze(-1), actual_tokens_per_expert
-            )
+        if self.config.moe_use_device_initiated_grouped_gemm:
+            tokens_per_expert = tokens_per_expert.long().to("cuda", non_blocking=True)
+        else:
+            tokens_per_expert = tokens_per_expert.long().cpu().tolist()
+        
+        actual_tokens_per_expert = tokens_per_expert
+        if self.config.fp8:
+            if self.config.moe_use_device_initiated_grouped_gemm:
+                assert self.config.moe_router_padding_for_fp8, "Should set --moe-router-padding-for-fp8 to use router padding for fp8 when enabled device-initiated grouped gemm."
+                permuted_probs = permuted_probs.unsqueeze(-1)
+            else:
+                permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+                permuted_probs, _ = self.quantization_padding(
+                    permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+                )
         else:
             permuted_probs = permuted_probs.unsqueeze(-1)
 
@@ -775,8 +783,11 @@ class TEGroupedMLP(MegatronModule):
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
-        if self.config.fp8 or self.config.fp4:
-            output = self.quantization_unpadding(output, actual_tokens_per_expert)
+        if self.config.fp8:
+            if self.config.moe_use_device_initiated_grouped_gemm:
+                assert self.config.moe_router_padding_for_fp8, "Should set --moe-router-padding-for-fp8 to use router padding for fp8 when enabled device-initiated grouped gemm."
+            else:
+                output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
         output_bias = None
 
