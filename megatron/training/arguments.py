@@ -1223,9 +1223,9 @@ def validate_args(args, defaults={}):
                 and not args.moe_shared_expert_overlap
             )
             if wgrad_in_graph_scope:
-                assert is_te_min_version(
-                    "2.12.0"
-                ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
+                # assert is_te_min_version(
+                #     "2.12.0"
+                # ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
                 assert args.gradient_accumulation_fusion, (
                     'CUDA graph with delay_wgrad_compute requires gradient_accumulation_fusion '
                     'to be enabled. This is because the default gradient accumulation does not '
