@@ -992,7 +992,9 @@ def forward_backward_pipelining_with_interleaving(
     config = get_model_config(model[0])
     if p2p_communicator is None and pg_collection is None:
         p2p_communicator = P2PCommunicator(
-            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
+            pp_group=parallel_state.get_pipeline_model_parallel_group(),
+            config=config,
+            use_separate_send_recv_groups=config.use_separate_send_recv_groups,
         )
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
@@ -2141,7 +2143,9 @@ def forward_backward_pipelining_without_interleaving(
 
     if p2p_communicator is None and pg_collection is None:
         p2p_communicator = P2PCommunicator(
-            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
+            pp_group=parallel_state.get_pipeline_model_parallel_group(),
+            config=config,
+            use_separate_send_recv_groups=config.use_separate_send_recv_groups,
         )
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
