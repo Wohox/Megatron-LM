@@ -1661,7 +1661,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
-                out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+                out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch, is_device_initialized=self.config.moe_use_device_initiated_grouped_gemm)
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
