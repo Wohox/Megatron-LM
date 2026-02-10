@@ -546,6 +546,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
+        if enable_hybridep or enable_deepep:
+            tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
+            if layer.config.moe_use_device_initiated_grouped_gemm:
+                tokens_per_expert = tokens_per_expert.long().to("cuda", non_blocking=True)
+            else:
+                tokens_per_expert = tokens_per_expert.long().cpu().tolist()
+            token_dispatcher._comm_manager.tokens_per_expert = tokens_per_expert
+
         expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
         # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
