@@ -56,6 +56,20 @@ def build_data(seq_len=1024):
 
     return hidden_states
 
+@contextmanager
+def env_vars_ctx(envs):
+    origin_envs = {}
+    for k, v in envs.items():
+        origin_envs[k] = os.environ.get(k)
+        os.environ[k] = v
+    try:
+        yield
+    finally:
+        for k in envs:
+            if origin_envs[k] is not None:
+                os.environ[k] = origin_envs[k]
+            elif k in os.environ:
+                del os.environ[k]
 
 @contextmanager
 def deterministic_mode():
