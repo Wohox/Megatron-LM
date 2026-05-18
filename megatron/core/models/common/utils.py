@@ -18,7 +18,7 @@ from typing import Callable
 import torch
 
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
@@ -100,7 +100,7 @@ def should_free_input(name, is_moe, config, num_local_experts):
         # If moe_preprocess is in cuda graph scope, tokens and probs are fixed size
         # tensors, so they cannot be freed.
         "moe_dispatch": not (enable_deepep or enable_hybridep)
-        and (CudaGraphScope.moe_preprocess not in config.cuda_graph_scope),
+        and (CudaGraphModule.moe_preprocess not in config.cuda_graph_modules),
     }
 
     return free_input_nodes.get(name, False)
@@ -254,9 +254,16 @@ class TransformerLayerNode(ScheduleNode):
         self.detached = tuple()
         self.before_detached = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
+        self.post_wgrad_grad_acc_hooks = None
 
         self.is_first_layer = extra_args.get("is_first_layer", False)
         self.is_last_layer = extra_args.get("is_last_layer", False)
+
+        # Whether this slot is the first/last node of its TransformerLayer in
+        # forward / backward order. Set by ``set_post_*_hook``; used to decide
+        # when to invoke the layer-level FSDP reshard hooks.
+        self.is_layer_first_node = None
+        self.is_layer_last_node = None
 
         self.bwd_dw_callables = []
         if bwd_dw_callables is not None:
@@ -289,6 +296,24 @@ class TransformerLayerNode(ScheduleNode):
 
         return grads
 
+    def forward(self, *inputs):
+        """Execute forward and fire the per-layer post-forward hook on the last slot."""
+        output = super().forward(*inputs)
+        if self.is_layer_last_node:
+            self._post_forward_hook()
+        return output
+
+    def backward(self, *output_grad):
+        """Execute backward and fire the per-layer post-backward hook on the first slot.
+
+        When ``delay_wgrad_compute`` is set, the hook fires after ``backward_dw``
+        instead, because the wgrad work has not yet run when ``backward`` returns.
+        """
+        grads = super().backward(*output_grad)
+        if not self.delay_wgrad_compute and self.is_layer_first_node:
+            self._post_backward_hook()
+        return grads
+
     def backward_dw(self):
         """Run the slot's delayed weight-gradient callables on the slot's stream."""
         if not self.delay_wgrad_compute:
@@ -302,7 +327,39 @@ class TransformerLayerNode(ScheduleNode):
                 module.backward_dw()
             nvtx_range_pop(nvtx_msg)
 
+        # Collect ``post_wgrad_grad_acc_hook`` from params whose grads were
+        # produced by *this* slot's wgrad callables. The hook must run on the
+        # same stream right after the wgrad it depends on; collecting on the
+        # first invocation makes the per-iteration hook order deterministic.
+        if self.post_wgrad_grad_acc_hooks is None:
+            self.post_wgrad_grad_acc_hooks = []
+            for module in self.bwd_dw_callables:
+                for param in module.parameters():
+                    if (
+                        getattr(param, "post_wgrad_grad_acc_hook", False)
+                        and param.requires_grad
+                        and param.grad is not None
+                    ):
+                        self.post_wgrad_grad_acc_hooks.append(param.post_wgrad_grad_acc_hook)
+
+        if self.post_wgrad_grad_acc_hooks:
+            with torch.cuda.stream(self.stream):
+                for hook in self.post_wgrad_grad_acc_hooks:
+                    hook()
+
+        if self.is_layer_first_node:
+            self._post_backward_hook()
         self.bwd_dw_callables = None
+
+    def set_post_forward_hook(self, hook):
+        """Mark this slot as the layer's last fwd node and register the hook."""
+        self.is_layer_last_node = True
+        self._post_forward_hook = hook
+
+    def set_post_backward_hook(self, hook):
+        """Mark this slot as the layer's first bwd node and register the hook."""
+        self.is_layer_first_node = True
+        self._post_backward_hook = hook
 
     def __del__(self):
         # Release references early to help avoid leaks across iterations.
@@ -334,22 +391,25 @@ class _BackwardDWWrapper:
         self.layer = layer
         self.graphed_backward_dw_callable = None
         self.attn_dw_callable = layer.self_attention.backward_dw
+        self.submodules = [layer.self_attention]
         if layer.is_moe_layer:
             self.shared_expert_dw_callable = partial(
                 layer.mlp.backward_dw, routed_experts=False, shared_experts=True
             )
+            if layer.mlp.use_shared_expert:
+                self.submodules.append(layer.mlp.shared_experts)
         else:
             self.shared_expert_dw_callable = None
-        self.cuda_graph_scope = layer.config.cuda_graph_scope
+        self.cuda_graph_modules = layer.config.cuda_graph_modules
 
     def backward_dw(self):
         """Run eager or graphed backward wgrad callables for the wrapped layer."""
         is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
         if self.shared_expert_dw_callable is not None and (
-            not is_replay or CudaGraphScope.moe_router not in self.cuda_graph_scope
+            not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
         ):
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphScope.attn not in self.cuda_graph_scope:
+        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
             self.attn_dw_callable()
         if is_replay and self.graphed_backward_dw_callable is not None:
             self.graphed_backward_dw_callable()
@@ -358,3 +418,14 @@ class _BackwardDWWrapper:
     def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
         """Plug the cuda-graph backward wgrad replay callable."""
         self.graphed_backward_dw_callable = graphed_backward_dw_callable
+
+    def parameters(self):
+        """Yield parameters from the wrapped layer's wgrad submodules.
+
+        Mirrors ``torch.nn.Module.parameters`` so callers (notably
+        ``TransformerLayerNode.backward_dw``) can collect ``post_wgrad_grad_acc_hook``
+        without knowing the concrete layer layout.
+        """
+        for module in self.submodules:
+            for param in module.parameters():
+                yield param

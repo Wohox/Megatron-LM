@@ -22,7 +22,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -393,13 +393,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # static-batching inference; otherwise leave it as ``None``.
         if (
             in_inference_mode
-            and (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            and (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context.is_static_batching()
         ):
             current_batch_size = input_ids.shape[0]
@@ -629,7 +623,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -649,7 +643,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         """
         Create the cudagraph manager for the full iteration inference scope
         """
-        if CudaGraphScope.full_iteration_inference in config.cuda_graph_scope:
+        if config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
             self.cudagraph_manager = CudaGraphManager(config)
