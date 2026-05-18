@@ -15,6 +15,7 @@ from tests.unit_tests.a2a_overlap.utils import (
     compare_captures,
     deterministic_mode,
     get_test_config,
+    get_valid_flex_dispatcher_backend,
     get_valid_token_dispatcher_types,
     reset_model,
 )
@@ -137,7 +138,7 @@ class TestTransformerLayerSubmoduleCallables:
             "moe_permute_fusion": permute_fusion,
         }
         if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
         config = get_test_config(extra_kwargs=extra_kwargs, moe_grouped_gemm=grouped_gemm)
         microbatches = 4
         with deterministic_mode():
