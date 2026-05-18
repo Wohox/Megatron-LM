@@ -45,6 +45,18 @@ class _SharedExpertBackwardDWWrapper:
         self.layer = None
         self.shared_expert_dw_callable = None
 
+    def parameters(self):
+        """Expose shared-expert params so post_wgrad_grad_acc_hook discovery works.
+
+        The schedule node's backward_dw iterates module.parameters() looking for
+        post_wgrad_grad_acc_hook on each param. _SharedExpertBackwardDWWrapper is
+        a plain class (not nn.Module), so we forward to layer.mlp.shared_experts.
+        Returns an empty iterator after backward_dw has cleared the layer ref.
+        """
+        if self.layer is None or self.layer.mlp.shared_experts is None:
+            return iter([])
+        return self.layer.mlp.shared_experts.parameters()
+
 
 class HybridStackNode(TransformerLayerNode):
     """Schedule node for HybridStack-built fine-grained callables.
