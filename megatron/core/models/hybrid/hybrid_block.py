@@ -194,6 +194,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        is_mtp_layer=is_mtp_layer,
                     )
                 elif layer_type == LayerSymbols.GDN:
                     layer = build_module(
