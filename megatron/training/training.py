@@ -1551,6 +1551,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             DP = torch_FSDP
         elif args.use_megatron_fsdp:
             DP = megatron_FSDP
+            if args.overlap_moe_expert_parallel_comm and is_hybrid_model(args):
+                from megatron.core.models.hybrid.hybrid_block import HybridStack
+                DP = functools.partial(megatron_FSDP, fsdp_unit_modules=[HybridStack])
         else:
             DP = DDP
 

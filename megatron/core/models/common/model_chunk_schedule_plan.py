@@ -190,15 +190,17 @@ class TransformerLayerSchedulePlan:
             post_backward_hook: Callable(module) that releases backward-pass params
                 (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
         """
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
-        assert isinstance(self.layer, (TransformerLayer, MultiTokenPredictionLayer)), (
+        assert isinstance(self.layer, (TransformerLayer, HybridStack, MultiTokenPredictionLayer)), (
             f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
+            f"HybridStack and MultiTokenPredictionLayer, "
             f"but got {type(self.layer).__name__}."
         )
 
-        if isinstance(self.layer, TransformerLayer):
+        if isinstance(self.layer, (TransformerLayer, HybridStack)):
             hook_module = self.layer
         else:
             hook_module = self.layer.mtp_model_layer
