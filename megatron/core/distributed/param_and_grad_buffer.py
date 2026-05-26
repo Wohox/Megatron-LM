@@ -269,9 +269,21 @@ class _ParamAndGradBucketGroup:
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
+        # DIAG: import diagnostic helpers lazily to avoid circular import.
+        try:
+            from megatron.core.optimizer.layer_wise_optimizer import (
+                _DIAG_ITER,
+                _DIAG_MAX_ITERS,
+                _diag_hash,
+            )
+            diag_active = _DIAG_ITER[0] <= _DIAG_MAX_ITERS
+        except Exception:
+            diag_active = False
+
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-            for bucket in self.buckets:
+            for bucket_idx, bucket in enumerate(self.buckets):
                 is_bf16_weight_bucket = False
+                first_quantize_logged = False
                 for param in bucket.params:
                     # Skip copying since bf16 weights in the mxfp8 model
                     # are already mapped to param.data.
@@ -280,8 +292,48 @@ class _ParamAndGradBucketGroup:
                         break
                     param_start, param_end = bucket.param_to_index[param]
                     param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                    if diag_active and not first_quantize_logged:
+                        _diag_hash(
+                            f"_post_param_sync/bucket{bucket_idx}/bf16_in",
+                            param_slice,
+                        )
                     param.data.copy_(param_slice.view(param.data.shape))
+                    if diag_active and not first_quantize_logged:
+                        rw = getattr(param.data, '_rowwise_data', None)
+                        cw = getattr(param.data, '_columnwise_data', None)
+                        rsi = getattr(param.data, '_rowwise_scale_inv', None)
+                        csi = getattr(param.data, '_columnwise_scale_inv', None)
+                        q = getattr(param.data, '_quantizer', None)
+                        if q is not None:
+                            print(
+                                f"[DIAG iter={_DIAG_ITER[0]}] "
+                                f"_post_param_sync/bucket{bucket_idx} quantizer "
+                                f"rw={q.rowwise_usage} cw={q.columnwise_usage}",
+                                flush=True,
+                            )
+                        _diag_hash(
+                            f"_post_param_sync/bucket{bucket_idx}/mxfp8_rw",
+                            rw,
+                        )
+                        _diag_hash(
+                            f"_post_param_sync/bucket{bucket_idx}/mxfp8_cw",
+                            cw,
+                        )
+                        _diag_hash(
+                            f"_post_param_sync/bucket{bucket_idx}/mxfp8_rsi",
+                            rsi,
+                        )
+                        _diag_hash(
+                            f"_post_param_sync/bucket{bucket_idx}/mxfp8_csi",
+                            csi,
+                        )
+                        first_quantize_logged = True
                 if is_bf16_weight_bucket:
+                    if diag_active:
+                        _diag_hash(
+                            f"_post_param_sync/bucket{bucket_idx}/bf16_bucket_post_AG",
+                            bucket.param_data,
+                        )
                     continue
                 # All-gathered params are not needed after being copied to param.data.
                 # Zero out the param buffer (shared with grad buffer) for gradient accumulation.

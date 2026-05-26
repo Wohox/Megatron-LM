@@ -33,6 +33,48 @@ from .param_layout import (
 
 logger = logging.getLogger(__name__)
 
+# DIAG: instrumentation for ON-vs-OFF MXFP8 loss-divergence investigation.
+# Increments each time LayerWise.step_with_ready_grads runs; prints fingerprints
+# (sum/norm/amax/byte-sum) of the bf16 staging buffer and MXFP8 storage at key
+# step boundaries on rank 0 for the first DIAG_MAX_ITERS iterations. Remove once
+# the bug is localized.
+_DIAG_ITER = [0]
+_DIAG_MAX_ITERS = 5
+
+
+def _diag_should_print() -> bool:
+    if not torch.distributed.is_initialized():
+        return _DIAG_ITER[0] <= _DIAG_MAX_ITERS
+    return _DIAG_ITER[0] <= _DIAG_MAX_ITERS and torch.distributed.get_rank() == 0
+
+
+def _diag_hash(tag: str, t) -> None:
+    if not _diag_should_print():
+        return
+    if t is None:
+        print(f"[DIAG iter={_DIAG_ITER[0]}] {tag}: None", flush=True)
+        return
+    if t.dtype == torch.uint8:
+        flat = t.detach().contiguous().view(-1)
+        byte_sum = int(flat.long().sum().item())
+        byte_max = int(flat.max().item())
+        byte_min = int(flat.min().item())
+        print(
+            f"[DIAG iter={_DIAG_ITER[0]}] {tag}: byte_sum={byte_sum} "
+            f"byte_max={byte_max} byte_min={byte_min} numel={t.numel()}",
+            flush=True,
+        )
+    else:
+        f = t.detach().to(torch.float32).flatten()
+        s = f.sum().item()
+        n = f.norm().item()
+        am = f.abs().max().item()
+        print(
+            f"[DIAG iter={_DIAG_ITER[0]}] {tag}: sum={s:.6e} norm={n:.6e} "
+            f"amax={am:.6e} numel={f.numel()}",
+            flush=True,
+        )
+
 
 def _skip_mxfp8_in_copy_main_to_model(
     inner_opt: 'Float16OptimizerWithFloat16Params',
@@ -937,6 +979,31 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         main_param.data.view(-1)
                     )
 
+    def _diag_find_probe(self):
+        """Find a stable diagnostic probe: first LayerWise-managed bucket and a
+        local-rank-owned param within it (if any). Returns (bucket, param)."""
+        local_dp_rank = get_pg_rank(self.pg_collection.dp_cp)
+        local_owned_set = set()
+        if self.dp_cp_params_list is not None:
+            for p in self.dp_cp_params_list[local_dp_rank]:
+                local_owned_set.add(id(p))
+        for model_chunk in self.model_chunks:
+            buffers = list(model_chunk.buffers) + list(model_chunk.expert_parallel_buffers)
+            for buffer in buffers:
+                for bucket in buffer.buckets:
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                        continue
+                    probe_param = None
+                    for p in bucket.params_list:
+                        if local_owned_set and id(p) not in local_owned_set:
+                            continue
+                        probe_param = p
+                        break
+                    if probe_param is None and bucket.params_list:
+                        probe_param = bucket.params_list[0]
+                    return bucket, probe_param
+        return None, None
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step then all-gather LayerWise-managed param buffers.
@@ -946,7 +1013,29 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         which calls ``step_with_ready_grads`` directly on each child and bypasses
         ``step``.
         """
+        _DIAG_ITER[0] += 1
+        diag_bucket, diag_param = (None, None)
+        if _DIAG_ITER[0] <= _DIAG_MAX_ITERS:
+            diag_bucket, diag_param = self._diag_find_probe()
+            if diag_bucket is not None:
+                _diag_hash("step_start/bucket.param_data", diag_bucket.param_data)
+                if diag_param is not None:
+                    ps, pe = diag_bucket.param_to_index[diag_param]
+                    _diag_hash(
+                        "step_start/probe.bf16_slice",
+                        diag_bucket.param_data.view(-1)[ps:pe],
+                    )
+
         success = super().step_with_ready_grads()
+
+        if _DIAG_ITER[0] <= _DIAG_MAX_ITERS and diag_bucket is not None:
+            _diag_hash("after_super_step/bucket.param_data", diag_bucket.param_data)
+            if diag_param is not None:
+                ps, pe = diag_bucket.param_to_index[diag_param]
+                _diag_hash(
+                    "after_super_step/probe.bf16_slice",
+                    diag_bucket.param_data.view(-1)[ps:pe],
+                )
 
         # MXFP8 + ``reuse_grad_buf_for_mxfp8_param_ag``: write the just-updated
         # fp32 master shards into ``param_buffer`` before the AG dispatches
@@ -956,6 +1045,23 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # then; in non-overlap mode the ``start_param_sync_for_bucket_group_subset``
         # call below dispatches synchronously and sees the correct buffer.
         self._write_owned_mxfp8_masters_to_param_buffer()
+
+        if _DIAG_ITER[0] <= _DIAG_MAX_ITERS and diag_bucket is not None:
+            _diag_hash("after_write/bucket.param_data", diag_bucket.param_data)
+            if diag_param is not None:
+                ps, pe = diag_bucket.param_to_index[diag_param]
+                _diag_hash(
+                    "after_write/probe.bf16_slice",
+                    diag_bucket.param_data.view(-1)[ps:pe],
+                )
+                if is_mxfp8tensor(diag_param):
+                    q = getattr(diag_param, '_quantizer', None)
+                    if q is not None:
+                        print(
+                            f"[DIAG iter={_DIAG_ITER[0]}] before_AG quantizer "
+                            f"rw_usage={q.rowwise_usage} cw_usage={q.columnwise_usage}",
+                            flush=True,
+                        )
 
         # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
@@ -971,6 +1077,25 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 self.start_param_sync_for_bucket_group_subset()
             else:
                 self.allgather_params()
+
+        if _DIAG_ITER[0] <= _DIAG_MAX_ITERS and diag_bucket is not None:
+            _diag_hash("after_AG/bucket.param_data", diag_bucket.param_data)
+            if diag_param is not None and is_mxfp8tensor(diag_param):
+                _diag_hash(
+                    "after_AG/probe._rowwise_data", diag_param.data._rowwise_data
+                )
+                _diag_hash(
+                    "after_AG/probe._columnwise_data",
+                    diag_param.data._columnwise_data,
+                )
+                _diag_hash(
+                    "after_AG/probe._rowwise_scale_inv",
+                    diag_param.data._rowwise_scale_inv,
+                )
+                _diag_hash(
+                    "after_AG/probe._columnwise_scale_inv",
+                    diag_param.data._columnwise_scale_inv,
+                )
 
         return success
 
