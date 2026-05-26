@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 # the bug is localized.
 _DIAG_ITER = [0]
 _DIAG_MAX_ITERS = 5
+# Probe param identity (set per-step by _diag_find_probe so _post_param_sync
+# can target the SAME param's data instead of "first param in bucket 0").
+_DIAG_PROBE_ID = [None]
 
 
 def _diag_should_print() -> bool:
@@ -130,6 +133,45 @@ def _skip_mxfp8_in_copy_main_to_model(
     inner_opt._copy_main_params_to_model_params = (
         patched_copy_main_params_to_model_params
     )
+
+
+def _restore_high_precision_init_val(
+    inner_opt: 'Float16OptimizerWithFloat16Params',
+) -> None:
+    """Overwrite the fp32 master of any MXFP8 model param with the BF16 init
+    values that TE preserved on CPU at module construction.
+
+    Float16OptimizerWithFloat16Params.__init__ creates the master via
+    ``param.detach().clone().float()``. For an MXFP8Tensor model param,
+    ``.float()`` calls ``QuantizedTensor.dequantize(dtype=fp32)`` — the master
+    is therefore initialized from FP8-quantized values, not the original BF16
+    init, and carries ~FP8 precision noise relative to the bf16 init from
+    iter 0. DistributedOptimizer fixes this by reading
+    ``model_param.get_high_precision_init_val()`` (a CPU bf16 tensor TE saves
+    at base.py:1461 before the quantize-wrap) — see
+    ``distrib_optimizer.py`` lines 405-416. Mirror that fix for the LayerWise
+    inner so muon's fp32 masters start bit-identical to the bf16 baseline.
+    No-op for params without the attribute (non-MXFP8 / TE versions without
+    preserved init vals).
+    """
+    if inner_opt is None or not hasattr(inner_opt, 'float16_groups'):
+        return
+    for model_group, main_group in zip(
+        inner_opt.float16_groups, inner_opt.fp32_from_float16_groups
+    ):
+        for model_param, main_param in zip(model_group, main_group):
+            if not hasattr(model_param, 'get_high_precision_init_val'):
+                continue
+            init_val = model_param.get_high_precision_init_val()
+            if init_val is None:
+                continue
+            main_param.data.copy_(
+                init_val.view(model_param.shape).to(
+                    device=main_param.device, dtype=torch.float32
+                )
+            )
+            if hasattr(model_param, 'clear_high_precision_init_val'):
+                model_param.clear_high_precision_init_val()
 
 
 def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
@@ -535,6 +577,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # storage at the inner step. Replicate that exactly here.
                 if config.reuse_grad_buf_for_mxfp8_param_ag:
                     _skip_mxfp8_in_copy_main_to_model(inner_opt)
+                # Mirror DistributedOptimizer's master-init fix-up: when the
+                # model param is MXFP8 (``primary_weights_in_fp8=True``), the
+                # default inner construction sets ``main_param = param.detach()
+                # .clone().float()`` which DEQUANTIZES the MXFP8 storage and
+                # bakes the FP8 quantization noise into the fp32 master from
+                # iter 0. TE preserves the original bf16/fp16 init values on
+                # CPU via ``_high_precision_init_val``; DistOpt reads them back
+                # at master construction (see ``distrib_optimizer.py`` lines
+                # 405-416). Without this, ON masters disagree with OFF masters
+                # by ~FP8 precision, the subsequent bf16⇒MXFP8 round-trip
+                # amplifies the residual, and muon's NS step produces slightly
+                # different updates each iter — observed as a small loss lag
+                # vs the fp8_param_gather=False baseline that doesn't fully
+                # close even by iter 100.
+                _restore_high_precision_init_val(inner_opt)
                 optimizers[i] = inner_opt
 
         super().__init__(optimizers)
@@ -981,7 +1038,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     def _diag_find_probe(self):
         """Find a stable diagnostic probe: first LayerWise-managed bucket and a
-        local-rank-owned param within it (if any). Returns (bucket, param)."""
+        local-rank-owned param within it (if any). Returns (bucket, param).
+
+        Also sets _DIAG_PROBE_ID so _post_param_sync's diag can target the same
+        param's MXFP8 storage instead of "first param in bucket".
+        """
         local_dp_rank = get_pg_rank(self.pg_collection.dp_cp)
         local_owned_set = set()
         if self.dp_cp_params_list is not None:
@@ -1001,6 +1062,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         break
                     if probe_param is None and bucket.params_list:
                         probe_param = bucket.params_list[0]
+                    _DIAG_PROBE_ID[0] = id(probe_param) if probe_param is not None else None
+                    if probe_param is not None and _diag_should_print():
+                        print(
+                            f"[DIAG iter={_DIAG_ITER[0]}] probe ident: "
+                            f"id=0x{id(probe_param):x} shape={tuple(probe_param.shape)} "
+                            f"numel={probe_param.numel()} dtype={probe_param.dtype} "
+                            f"is_mxfp8={is_mxfp8tensor(probe_param)} "
+                            f"managed_by_lw={getattr(probe_param, 'is_managed_by_layer_wise_optimizer', '?')}",
+                            flush=True,
+                        )
                     return bucket, probe_param
         return None, None
 

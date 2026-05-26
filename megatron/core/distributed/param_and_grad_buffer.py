@@ -274,16 +274,18 @@ class _ParamAndGradBucketGroup:
             from megatron.core.optimizer.layer_wise_optimizer import (
                 _DIAG_ITER,
                 _DIAG_MAX_ITERS,
+                _DIAG_PROBE_ID,
                 _diag_hash,
             )
             diag_active = _DIAG_ITER[0] <= _DIAG_MAX_ITERS
+            probe_id = _DIAG_PROBE_ID[0]
         except Exception:
             diag_active = False
+            probe_id = None
 
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket_idx, bucket in enumerate(self.buckets):
                 is_bf16_weight_bucket = False
-                first_quantize_logged = False
                 for param in bucket.params:
                     # Skip copying since bf16 weights in the mxfp8 model
                     # are already mapped to param.data.
@@ -292,13 +294,14 @@ class _ParamAndGradBucketGroup:
                         break
                     param_start, param_end = bucket.param_to_index[param]
                     param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    if diag_active and not first_quantize_logged:
+                    is_probe = diag_active and probe_id is not None and id(param) == probe_id
+                    if is_probe:
                         _diag_hash(
-                            f"_post_param_sync/bucket{bucket_idx}/bf16_in",
+                            f"_post_param_sync/PROBE/bucket{bucket_idx}/bf16_in",
                             param_slice,
                         )
                     param.data.copy_(param_slice.view(param.data.shape))
-                    if diag_active and not first_quantize_logged:
+                    if is_probe:
                         rw = getattr(param.data, '_rowwise_data', None)
                         cw = getattr(param.data, '_columnwise_data', None)
                         rsi = getattr(param.data, '_rowwise_scale_inv', None)
@@ -307,27 +310,26 @@ class _ParamAndGradBucketGroup:
                         if q is not None:
                             print(
                                 f"[DIAG iter={_DIAG_ITER[0]}] "
-                                f"_post_param_sync/bucket{bucket_idx} quantizer "
+                                f"_post_param_sync/PROBE/bucket{bucket_idx} quantizer "
                                 f"rw={q.rowwise_usage} cw={q.columnwise_usage}",
                                 flush=True,
                             )
                         _diag_hash(
-                            f"_post_param_sync/bucket{bucket_idx}/mxfp8_rw",
+                            f"_post_param_sync/PROBE/bucket{bucket_idx}/mxfp8_rw",
                             rw,
                         )
                         _diag_hash(
-                            f"_post_param_sync/bucket{bucket_idx}/mxfp8_cw",
+                            f"_post_param_sync/PROBE/bucket{bucket_idx}/mxfp8_cw",
                             cw,
                         )
                         _diag_hash(
-                            f"_post_param_sync/bucket{bucket_idx}/mxfp8_rsi",
+                            f"_post_param_sync/PROBE/bucket{bucket_idx}/mxfp8_rsi",
                             rsi,
                         )
                         _diag_hash(
-                            f"_post_param_sync/bucket{bucket_idx}/mxfp8_csi",
+                            f"_post_param_sync/PROBE/bucket{bucket_idx}/mxfp8_csi",
                             csi,
                         )
-                        first_quantize_logged = True
                 if is_bf16_weight_bucket:
                     if diag_active:
                         _diag_hash(
