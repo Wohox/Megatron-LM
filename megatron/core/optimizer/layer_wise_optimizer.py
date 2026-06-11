@@ -455,11 +455,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         full_param_layouts = None
         if model_chunks is not None:
-            full_param_layouts = [
-                chunk.full_param_layout
-                for chunk in model_chunks
-                if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
-            ] or None
+            full_param_layouts = []
+            for chunk in model_chunks:
+                if not hasattr(chunk, 'full_param_layout') or chunk.full_param_layout is None:
+                    continue
+                layer_wise_layouts = {
+                    buffer_key: layout
+                    for buffer_key, layout in chunk.full_param_layout.layouts.items()
+                    if buffer_key.is_managed_by_layer_wise_optimizer
+                }
+                if layer_wise_layouts:
+                    full_param_layouts.append(FullParamLayout(layouts=layer_wise_layouts))
+            full_param_layouts = full_param_layouts or None
         self.shard_params(optimizers, full_param_layouts)
 
         # When a full_param_layout is available, ddp_config.use_distributed_optimizer

@@ -3909,13 +3909,10 @@ def _add_distributed_args(parser):
         action='store_false',
         dest='use_layer_wise_param_layout',
         help='Opt out of the precomputed LayerWise param layout. When set, '
-        'falls back to the legacy LayerWise ping-pong path: all params '
-        '(including non-Muon embeddings, biases, layernorm) live in a single '
-        'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-        'The default (precomputed layout) routes non-Muon params through a '
-        'separate DistributedOptimizer with byte-level sharding, which is faster '
-        'and uses less padding but produces different bf16 reduction ordering '
-        'and so will not match legacy-path loss curves bit-for-bit.',
+        'LayerWise-managed matrix params use the legacy ping-pong '
+        'allgather_params() path, while non-Muon embeddings, biases, layernorms, '
+        'and other non-LayerWise params remain on a separate DistributedOptimizer '
+        'with byte-level sharding.',
     )
     group.add_argument(
         '--use-nccl-ub',

@@ -57,6 +57,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
     tag_params_for_buffer_routing,
 )
+from megatron.core.optimizer.param_layout import FullParamLayout
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 
 from .log_handler import CustomHandler
@@ -1590,9 +1591,12 @@ def wrap_model_chunks_with_ddp(
     For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
     forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
     for reduce-scatter), and computes per-chunk shard-aligned layouts via
-    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
-    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
-    to its legacy ``allgather_params`` sync path.
+    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`.
+
+    With ``use_layer_wise_param_layout=False``, LayerWise-managed matrix params
+    keep the legacy no-padding ``allgather_params`` sync path, while non-LayerWise
+    params still receive a byte-level DistributedOptimizer layout so embeddings,
+    biases, and 1D params stay on the standard DistOpt path.
 
     For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
     computes per-chunk byte-level layouts via
@@ -1634,14 +1638,18 @@ def wrap_model_chunks_with_ddp(
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
     if DP is DDP:
-        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+        if use_layer_wise_distributed_optimizer:
             ddp_config.use_distributed_optimizer = True
-            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
             # Tag params so DDP buffer grouping routes LayerWise-managed matrices
             # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
             # everything else (embeddings, biases, layernorm) to a separate
             # DistOpt-style buffer.
             tag_params_for_buffer_routing(model_chunks)
+            compute_layout = (
+                LayerWiseDistributedOptimizer.compute_full_param_layout
+                if use_layer_wise_param_layout
+                else DistributedOptimizer.compute_full_param_layout
+            )
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
         else:
@@ -1653,12 +1661,23 @@ def wrap_model_chunks_with_ddp(
             expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
-                per_chunk_layouts[i] = compute_layout(
-                    all_params,
-                    bucket_size,
-                    data_parallel_world_size,
-                    ddp_config,
-                    expert_data_parallel_world_size=expert_data_parallel_world_size,
+                layout_params = all_params
+                if use_layer_wise_distributed_optimizer and not use_layer_wise_param_layout:
+                    layout_params = [
+                        p
+                        for p in all_params
+                        if not getattr(p, 'is_managed_by_layer_wise_optimizer', False)
+                    ]
+                per_chunk_layouts[i] = (
+                    compute_layout(
+                        layout_params,
+                        bucket_size,
+                        data_parallel_world_size,
+                        ddp_config,
+                        expert_data_parallel_world_size=expert_data_parallel_world_size,
+                    )
+                    if layout_params
+                    else FullParamLayout()
                 )
 
     # Wrap each chunk.
