@@ -98,6 +98,113 @@ def get_model_and_buffers(
     return model, param_and_grad_buffer, bucket_groups
 
 
+def _make_mock_pg(size: int = 2):
+    group = mock.MagicMock()
+    group.size.return_value = size
+    group.rank.return_value = 0
+    return group
+
+
+def _make_pg_collection(group):
+    pg_collection = mock.MagicMock()
+    pg_collection.dp_cp = group
+    pg_collection.tp = group
+    return pg_collection
+
+
+def _make_buffer_for_partial_layout_test(
+    *,
+    param_dtype=torch.bfloat16,
+    param_layout=None,
+    managed_by_layerwise=False,
+    params=None,
+):
+    if params is None:
+        params = [
+            torch.nn.Parameter(torch.ones((8, 8), dtype=torch.bfloat16)),
+            torch.nn.Parameter(torch.ones((8, 8), dtype=torch.bfloat16)),
+        ]
+    for param in params:
+        param.is_managed_by_layer_wise_optimizer = managed_by_layerwise
+    param_to_name = {param: f"param_{idx}" for idx, param in enumerate(params)}
+    group = _make_mock_pg()
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True,
+        overlap_param_gather=True,
+        bucket_size=None,
+    )
+    with (
+        mock.patch('torch.cuda.current_device', return_value='cpu'),
+        mock.patch('megatron.core.distributed.param_and_grad_buffer.log_on_each_pipeline_stage'),
+    ):
+        return _ParamAndGradBuffer(
+            ddp_config=ddp_config,
+            param_dtype=param_dtype,
+            grad_dtype=torch.bfloat16,
+            params_with_names=[(param, param_to_name[param]) for param in params],
+            data_parallel_group=group,
+            bucket_size=None,
+            param_to_name=param_to_name,
+            gradient_scaling_factor=1.0,
+            param_indices=list(range(len(params))),
+            nccl_ub=False,
+            pg_collection=_make_pg_collection(group),
+            param_layout=param_layout,
+        )
+
+
+def test_partial_layout_keeps_unlaid_out_layerwise_buffer_off_distopt():
+    """Hybrid LayerWise no-layout buffers must all-reduce full gradients."""
+    layerwise_buffer = _make_buffer_for_partial_layout_test(
+        param_dtype=torch.uint8,
+        param_layout=None,
+        managed_by_layerwise=True,
+    )
+
+    assert not layerwise_buffer.ddp_config.use_distributed_optimizer
+    assert layerwise_buffer.param_data is None
+    assert layerwise_buffer.numel == layerwise_buffer.numel_unpadded
+
+
+def test_partition_buckets_does_not_merge_mixed_distopt_modes():
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True, bucket_size=None)
+    distopt_params = [
+        torch.nn.Parameter(torch.ones((8, 8), dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.ones((8, 8), dtype=torch.bfloat16)),
+    ]
+    distopt_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+        distopt_params,
+        bucket_size=None,
+        data_parallel_world_size=2,
+        ddp_config=ddp_config,
+        param_indices=list(range(len(distopt_params))),
+    )
+
+    layerwise_buffer = _make_buffer_for_partial_layout_test(
+        param_dtype=torch.uint8,
+        param_layout=None,
+        managed_by_layerwise=True,
+    )
+    distopt_buffer = _make_buffer_for_partial_layout_test(
+        param_dtype=torch.bfloat16,
+        param_layout=distopt_layout,
+        managed_by_layerwise=False,
+        params=distopt_params,
+    )
+
+    bucket_groups = partition_buckets(
+        [layerwise_buffer, distopt_buffer],
+        force_single_bucket_group=False,
+        reduce_scatter_with_fp32_accumulation=False,
+    )
+
+    assert len(bucket_groups) == 2
+    assert sorted(group.ddp_config.use_distributed_optimizer for group in bucket_groups) == [
+        False,
+        True,
+    ]
+
+
 @pytest.mark.parametrize("bucket_size", [None, 9000, 9025, 9050, 18000, 18050, 20000])
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])

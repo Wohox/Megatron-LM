@@ -516,17 +516,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     opt, inner_config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
                 # Mirror DistributedOptimizer's ``reuse_grad_buf_for_mxfp8_param_ag``
-                # path: skip the inner's ``model.data.copy_(main fp32)`` for MXFP8
-                # model params (which would otherwise trigger an extra
-                # ``QuantizedTensor.__torch_dispatch__`` ⇒ ``dst.quantize_(fp32)``
-                # that then gets overwritten by the post-AG ``quantize_(bf16)``).
-                # The wasted double-quantization perturbs muon convergence
-                # vs the ``fp8_param_gather=False`` baseline. distopt's flow
-                # avoids this by routing through
-                # ``_copy_main_params_to_param_buffer`` in the
-                # ``reuse_grad_buf`` branch and never touching MXFP8 storage
-                # at the inner step. Replicate that exactly here.
-                if config.reuse_grad_buf_for_mxfp8_param_ag:
+                # path only when LayerWise uses DDP buffer param sync.  In the
+                # hybrid no-layout path, LayerWise still uses legacy
+                # allgather_params(), so model param storage must be refreshed
+                # from the fp32 masters before the gather reads param.data.
+                if config.reuse_grad_buf_for_mxfp8_param_ag and self.use_buffer_param_sync:
                     _skip_mxfp8_in_copy_main_to_model(inner_opt)
                 # Mirror DistributedOptimizer's master-init fix-up: when the
                 # model param is MXFP8 (``primary_weights_in_fp8=True``), the

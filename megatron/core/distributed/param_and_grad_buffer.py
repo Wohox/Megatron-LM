@@ -7,6 +7,7 @@ import math
 import os
 import warnings
 from contextlib import nullcontext
+from dataclasses import replace
 from enum import Enum
 from functools import partial
 from typing import Dict, List, Optional, Tuple
@@ -957,9 +958,20 @@ class _ParamAndGradBuffer:
             self.dp_cp_group = pg_collection.dp_cp
             self.tp_group = pg_collection.tp
 
-        self.ddp_config = ddp_config
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
+
+        # A partial full_param_layout means only the buffers with explicit
+        # layouts participate in the DistributedOptimizer reduce-scatter /
+        # all-gather contract.  Hybrid LayerWise Muon uses this to keep
+        # matrix weights on the legacy full-gradient all-reduce path while
+        # non-LayerWise params still use DistOpt.
+        buffer_uses_distributed_optimizer = ddp_config.use_distributed_optimizer and (
+            param_layout is not None
+        )
+        self.ddp_config = replace(
+            ddp_config, use_distributed_optimizer=buffer_uses_distributed_optimizer
+        )
 
         # Check that params are unique.
         unique_params = set()
@@ -1476,6 +1488,9 @@ class _ParamAndGradBuffer:
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
+        bucket.ddp_config = self.ddp_config
+        bucket.data_parallel_group = self.data_parallel_group
+        bucket.data_parallel_world_size = self.data_parallel_world_size
 
         return bucket
 
@@ -1577,19 +1592,29 @@ def partition_buckets(
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
     if force_single_bucket_group:
         buckets = []
-        ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
-        for buffer in buffers:
-            assert ddp_config == buffer.ddp_config
-            assert data_parallel_group == buffer.data_parallel_group
-            assert data_parallel_world_size == buffer.data_parallel_world_size
-            buckets.extend(buffer.buckets)
-
-        bucket_group = _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
-        )
-        return [bucket_group]
+        bucket_groups = []
+        for use_distributed_optimizer in [True, False]:
+            buckets = []
+            ddp_config = None
+            for buffer in buffers:
+                if buffer.ddp_config.use_distributed_optimizer != use_distributed_optimizer:
+                    continue
+                assert data_parallel_group == buffer.data_parallel_group
+                assert data_parallel_world_size == buffer.data_parallel_world_size
+                if ddp_config is None:
+                    ddp_config = buffer.ddp_config
+                else:
+                    assert ddp_config == buffer.ddp_config
+                buckets.extend(buffer.buckets)
+            if buckets:
+                bucket_groups.append(
+                    _ParamAndGradBucketGroup(
+                        buckets, ddp_config, data_parallel_group, data_parallel_world_size
+                    )
+                )
+        return bucket_groups
 
     if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
@@ -1608,11 +1633,18 @@ def partition_buckets(
         return bucket_groups
     else:
         # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
-        non_fp8_buckets = []
+        non_fp8_buckets_to_merge = []
+        non_fp8_buckets_to_split = []
         for buffer in buffers:
             if buffer.param_dtype != torch.uint8:
                 for bucket in buffer.buckets:
-                    non_fp8_buckets.append(bucket)
+                    if (
+                        buffer.ddp_config.use_distributed_optimizer
+                        == fp8_buffer.ddp_config.use_distributed_optimizer
+                    ):
+                        non_fp8_buckets_to_merge.append(bucket)
+                    else:
+                        non_fp8_buckets_to_split.append(bucket)
 
         bucket_groups = []
         for bucket in fp8_buffer.buckets:
@@ -1626,34 +1658,43 @@ def partition_buckets(
                     bucket_groups.append(
                         _ParamAndGradBucketGroup(
                             [bucket],
-                            buffer.ddp_config,
-                            buffer.data_parallel_group,
-                            buffer.data_parallel_world_size,
+                            fp8_buffer.ddp_config,
+                            fp8_buffer.data_parallel_group,
+                            fp8_buffer.data_parallel_world_size,
                         )
                     )
-                    if non_fp8_buckets:
-                        for non_fp8_bucket in non_fp8_buckets:
+                    if non_fp8_buckets_to_merge:
+                        for non_fp8_bucket in non_fp8_buckets_to_merge:
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    buffer.ddp_config,
-                                    buffer.data_parallel_group,
-                                    buffer.data_parallel_world_size,
+                                    fp8_buffer.ddp_config,
+                                    fp8_buffer.data_parallel_group,
+                                    fp8_buffer.data_parallel_world_size,
                                 )
                             )
 
                     continue  # Skip the default bucket group creation below
                 else:
-                    group_buckets = [bucket] + non_fp8_buckets
+                    group_buckets = [bucket] + non_fp8_buckets_to_merge
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
-                    buffer.ddp_config,
-                    buffer.data_parallel_group,
-                    buffer.data_parallel_world_size,
+                    fp8_buffer.ddp_config,
+                    fp8_buffer.data_parallel_group,
+                    fp8_buffer.data_parallel_world_size,
+                )
+            )
+        for non_fp8_bucket in non_fp8_buckets_to_split:
+            bucket_groups.append(
+                _ParamAndGradBucketGroup(
+                    [non_fp8_bucket],
+                    non_fp8_bucket.ddp_config,
+                    non_fp8_bucket.data_parallel_group,
+                    non_fp8_bucket.data_parallel_world_size,
                 )
             )
         return bucket_groups
