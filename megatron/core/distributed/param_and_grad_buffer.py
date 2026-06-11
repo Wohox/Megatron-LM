@@ -780,7 +780,7 @@ def group_params_for_buffers(
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
-    Each distinct buffer is identified by a BufferKey with three dimensions:
+    Each distinct buffer is identified by a BufferKey with four dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
     - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
@@ -811,15 +811,22 @@ def group_params_for_buffers(
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
         is_expert_parallel = not getattr(param, 'allreduce', True)
+        is_managed_by_layer_wise_optimizer = getattr(
+            param, 'is_managed_by_layer_wise_optimizer', False
+        )
 
-        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel)
+        key = BufferKey(
+            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+        )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
         key_to_params[key] = param_list
 
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
-        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel)
+        offset_key = BufferKey(
+            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+        )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1
         indices = key_to_indices.get(key, [])

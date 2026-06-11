@@ -23,6 +23,45 @@ from .optimizer_config import OptimizerConfig
 logger = logging.getLogger(__name__)
 
 
+def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
+    """Return whether ``param`` should be owned by LayerWise Muon.
+
+    Muon owns matrix-like weights that need whole-tensor Newton-Schulz updates.
+    Embeddings, output weights, biases, layernorms, and other vector-like
+    parameters stay on the Adam/DistributedOptimizer path.
+    """
+    if param.dim() != 2:
+        return False
+    if getattr(param, 'is_embedding_or_output_parameter', False):
+        return False
+    if getattr(param, 'shared_embedding', False):
+        return False
+    if getattr(param, 'is_embedding_parameter', False):
+        return False
+    return True
+
+
+def _bucket_is_managed_by_layer_wise_optimizer(
+    bucket, default_for_untagged: bool = True
+) -> bool:
+    """Return whether a DDP bucket belongs to LayerWise-owned params."""
+    if not bucket.params_list:
+        return False
+    param = bucket.params_list[0]
+    if not hasattr(param, 'is_managed_by_layer_wise_optimizer'):
+        return default_for_untagged
+    return param.is_managed_by_layer_wise_optimizer
+
+
+def tag_params_for_buffer_routing(model_chunks) -> None:
+    """Tag params before DDP groups them into contiguous buffers."""
+    for model_chunk in model_chunks:
+        for param in model_chunk.parameters():
+            if not param.requires_grad:
+                continue
+            param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+
+
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
@@ -164,6 +203,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for model_chunk in model_chunks:
             for group in model_chunk.bucket_groups:
                 for bucket in group.buckets:
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                        continue
                     bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
                     for bucket_list, full_params_list in zip(
                         bucket_params_list, self.dp_cp_params_list
@@ -175,6 +216,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:
                 for bucket in group.buckets:
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                        continue
                     if self.expt_dp_params_list is not None:
                         bucket_params_list = [
                             [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
@@ -279,14 +322,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     @torch.no_grad()
     def step(self):  # type: ignore[no-untyped-def]
         """step function for layer-wise optimizer."""
-        update_successful, grad_norm, num_zeros_in_grad = super().step()
+        return super().step()
 
-        # All gather updated params. If overlap_param_gather is True, the allgather
-        # is deferred to the forward pre-hooks via DDP bucket infrastructure.
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Step then synchronize LayerWise-owned params.
+
+        This method is used both by ``LayerWiseDistributedOptimizer.step()`` and
+        by an outer ``ChainedOptimizer`` when LayerWise is chained with a sibling
+        DistributedOptimizer for non-Muon params.
+        """
+        success = super().step_with_ready_grads()
         if not self.overlap_param_gather:
             self.allgather_params()
-
-        return update_successful, grad_norm, num_zeros_in_grad
+        return success
 
     # TODO(deyuf): need to improve dist checkpointing design to properly handle this
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty

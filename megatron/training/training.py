@@ -53,6 +53,8 @@ from typing import Any, Dict, Optional
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import tag_params_for_buffer_routing
+from megatron.core.optimizer.param_layout import FullParamLayout
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 
 from .log_handler import CustomHandler
@@ -1727,6 +1729,12 @@ def get_model(
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
+            if args.use_layer_wise_distributed_optimizer and DP is DDP:
+                tag_params_for_buffer_routing(model)
+                # Keep DDP in distributed-optimizer mode so non-LayerWise buffers
+                # can use byte-level RS/param AG while LayerWise buffers opt out
+                # per buffer.
+                ddp_config.use_distributed_optimizer = True
 
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
@@ -1749,15 +1757,30 @@ def get_model(
 
                 # Pre-compute parameter layouts for the distributed optimizer.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if args.use_distributed_optimizer and DP is DDP:
+                if (
+                    (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
+                    and DP is DDP
+                ):
                     all_params = [p for p in model_chunk.parameters() if p.requires_grad]
                     pp_rank = mpu.get_pipeline_model_parallel_rank()
                     effective_bucket_size = (
                         None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
                     )
+                    layout_params = all_params
+                    if args.use_layer_wise_distributed_optimizer:
+                        if getattr(args, 'use_layer_wise_param_layout', False):
+                            raise NotImplementedError(
+                                "use_layer_wise_param_layout=True is not implemented on this "
+                                "hybrid no-layout branch."
+                            )
+                        layout_params = [
+                            p
+                            for p in all_params
+                            if not getattr(p, 'is_managed_by_layer_wise_optimizer', False)
+                        ]
                     chunk_kwargs["full_param_layout"] = (
                         DistributedOptimizer.compute_full_param_layout(
-                            all_params,
+                            layout_params,
                             effective_bucket_size,
                             mpu.get_data_parallel_world_size(with_context_parallel=True),
                             ddp_config,
@@ -1765,6 +1788,8 @@ def get_model(
                                 mpu.get_expert_data_parallel_world_size()
                             ),
                         )
+                        if layout_params
+                        else FullParamLayout()
                     )
 
                 wrapped_model.append(

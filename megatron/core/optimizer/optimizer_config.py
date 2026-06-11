@@ -326,6 +326,14 @@ class OptimizerConfig:
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
 
+    use_layer_wise_param_layout: bool = False
+    """Use shard-aligned LayerWise DDP parameter layout.
+
+    This branch defaults to False so LayerWise-owned Muon matrices stay on the
+    legacy no-padding path, while non-LayerWise parameters can still use a
+    separate DistributedOptimizer.
+    """
+
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
         This argument is intended to have the same value as the "overlap_param_gather" argument 

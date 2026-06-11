@@ -3858,6 +3858,19 @@ def _add_distributed_args(parser):
         '--use-distributed-optimizer', action='store_true', help='Use distributed optimizer.'
     )
     group.add_argument(
+        '--use-layer-wise-param-layout',
+        action='store_true',
+        default=False,
+        help='Use shard-aligned LayerWise DDP parameter layout for LayerWise-managed params.',
+    )
+    group.add_argument(
+        '--no-use-layer-wise-param-layout',
+        action='store_false',
+        dest='use_layer_wise_param_layout',
+        help='Keep LayerWise-managed params on the legacy no-padding LayerWise path. '
+        'Non-LayerWise params may still use a separate DistributedOptimizer.',
+    )
+    group.add_argument(
         '--use-nccl-ub',
         action='store_true',
         dest='nccl_ub',

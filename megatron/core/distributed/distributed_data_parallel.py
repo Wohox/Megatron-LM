@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import logging
 from contextlib import contextmanager
 from typing import Optional
@@ -36,9 +37,9 @@ class DistributedDataParallel(_BaseDataParallel):
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
         pg_collection: Optional unified process group for distributed training.
-        full_param_layout: Optional FullParamLayout providing pre-computed layouts for all
-            dtype groups. When provided, each buffer uses the corresponding PerBufferParamLayout
-            instead of computing a default one.
+        full_param_layout: Optional FullParamLayout providing pre-computed layouts for dtype
+            groups that should use distributed-optimizer storage. Buffer groups omitted from
+            this layout use the default no-padding layout.
 
     """
 
@@ -149,14 +150,16 @@ class DistributedDataParallel(_BaseDataParallel):
                 expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
             )
 
-        # When a full_param_layout is provided, verify that the grouping is consistent
-        # with the layout (same buffer keys, same params per key, same param_indices).
+        # When a full_param_layout is provided, verify that the provided subset is consistent
+        # with the DDP grouping. LayerWise hybrid mode intentionally omits LayerWise-owned
+        # buffers so they can stay on the legacy no-padding path.
         if full_param_layout is not None:
-            assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
-                f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
-                f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
+            assert set(full_param_layout.layouts.keys()).issubset(set(buffer_groups.keys())), (
+                f"full_param_layout keys {set(full_param_layout.layouts.keys())} are not a "
+                f"subset of param grouping keys {set(buffer_groups.keys())}"
             )
-            for buffer_key, (params, param_indices) in buffer_groups.items():
+            for buffer_key in full_param_layout.layouts:
+                params, param_indices = buffer_groups[buffer_key]
                 layout = full_param_layout.layouts[buffer_key]
                 assert set(params) == set(
                     layout.param_index_map.keys()
@@ -235,9 +238,26 @@ class DistributedDataParallel(_BaseDataParallel):
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
             )
+            use_distributed_optimizer_for_buffer = self.ddp_config.use_distributed_optimizer
+            if (
+                self.ddp_config.use_distributed_optimizer
+                and getattr(buffer_key, 'is_managed_by_layer_wise_optimizer', False)
+                and param_layout is None
+            ):
+                use_distributed_optimizer_for_buffer = False
+            buffer_ddp_config = self.ddp_config
+            if use_distributed_optimizer_for_buffer != self.ddp_config.use_distributed_optimizer:
+                buffer_ddp_config = copy.copy(self.ddp_config)
+                buffer_ddp_config.use_distributed_optimizer = use_distributed_optimizer_for_buffer
+                if not use_distributed_optimizer_for_buffer:
+                    # Hybrid no-layout LayerWise buckets keep compact model params and are
+                    # synchronized by the LayerWise optimizer after its step.  They must not
+                    # enter DDP param-gather hooks, which expect DistOpt shard inputs.
+                    buffer_ddp_config.overlap_param_gather = False
+
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
-                self.ddp_config,
+                buffer_ddp_config,
                 buffer_key.param_dtype,
                 buffer_key.grad_dtype,
                 params_with_names,
@@ -264,19 +284,36 @@ class DistributedDataParallel(_BaseDataParallel):
         # kernels.
         # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
         # bucket group.
-        self.bucket_groups = partition_buckets(
-            self.buffers,
-            force_single_bucket_group=disable_bucketing,
-            reduce_scatter_with_fp32_accumulation=(
-                self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ),
-        )
-        self.expert_parallel_bucket_groups = partition_buckets(
-            self.expert_parallel_buffers,
-            force_single_bucket_group=disable_bucketing,
-            reduce_scatter_with_fp32_accumulation=(
-                self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ),
+        def _partition_compatible_buffers(buffers):
+            if len({buffer.ddp_config.use_distributed_optimizer for buffer in buffers}) <= 1:
+                return partition_buckets(
+                    buffers,
+                    force_single_bucket_group=disable_bucketing,
+                    reduce_scatter_with_fp32_accumulation=(
+                        self.ddp_config.reduce_scatter_with_fp32_accumulation
+                    ),
+                )
+            bucket_groups = []
+            for use_distributed_optimizer in (True, False):
+                compatible_buffers = [
+                    buffer
+                    for buffer in buffers
+                    if buffer.ddp_config.use_distributed_optimizer == use_distributed_optimizer
+                ]
+                bucket_groups.extend(
+                    partition_buckets(
+                        compatible_buffers,
+                        force_single_bucket_group=disable_bucketing,
+                        reduce_scatter_with_fp32_accumulation=(
+                            self.ddp_config.reduce_scatter_with_fp32_accumulation
+                        ),
+                    )
+                )
+            return bucket_groups
+
+        self.bucket_groups = _partition_compatible_buffers(self.buffers)
+        self.expert_parallel_bucket_groups = _partition_compatible_buffers(
+            self.expert_parallel_buffers
         )
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -293,15 +330,19 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
         # buckets in reverse order (since all-gathers happen in reverse order of buckets).
-        # Note: overlap_param_gather covers both the distributed optimizer and the
-        # layer-wise optimizer cases; the latter sets overlap_param_gather=True
-        # without use_distributed_optimizer.
         if self.ddp_config.overlap_param_gather:
             for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
-                num_bucket_groups = len(bucket_groups)
+                param_gather_bucket_groups = [
+                    bucket_group
+                    for bucket_group in bucket_groups
+                    if bucket_group.ddp_config.overlap_param_gather
+                ]
+                num_bucket_groups = len(param_gather_bucket_groups)
                 for i in range(1, num_bucket_groups):
-                    bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
-                        bucket_groups[num_bucket_groups - i - 1]
+                    param_gather_bucket_groups[
+                        num_bucket_groups - i
+                    ].next_param_gather_bucket_group = (
+                        param_gather_bucket_groups[num_bucket_groups - i - 1]
                     )
 
         # Create map from param to bucket group, used in pre_hook.
@@ -414,6 +455,10 @@ class DistributedDataParallel(_BaseDataParallel):
                     continue
                 assert param.requires_grad
 
+                bucket_group = self.param_to_bucket_group[param]
+                if not bucket_group.ddp_config.overlap_param_gather:
+                    continue
+
                 # If aligning param all-gather across pipeline stages, all-gather is dispatched
                 # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
                 # If overlapping param all-gather with optimizer step, then all-gather has
@@ -422,9 +467,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     self.ddp_config.align_param_gather
                     or self.overlap_param_gather_with_optimizer_step
                 )
-                self.param_to_bucket_group[param].finish_param_sync(
-                    skip_next_bucket_dispatch=skip_next_bucket_dispatch
-                )
+                bucket_group.finish_param_sync(skip_next_bucket_dispatch=skip_next_bucket_dispatch)
 
         return hook
 
@@ -491,15 +534,20 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            if not (
+                bucket_group.ddp_config.use_distributed_optimizer
+                or bucket_group.ddp_config.overlap_param_gather
+            ):
+                continue
             bucket_group.start_param_sync(force_sync=force_sync)
 
-            if not self.ddp_config.overlap_param_gather:
+            if not bucket_group.ddp_config.overlap_param_gather:
                 # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
                 # the param.data, since param buffer is not mapped to model params for MXFP8 case.
                 # The paramaters are cast from bf16 to MXFP8 during copy.
                 # In the case of "overlap_param_gather=True", the param copy is done
                 # in "finish_param_sync" stage after zeroing the shared gardient buffers.
-                if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                if bucket_group.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                     for bucket in bucket_group.buckets:
                         is_bf16_weight_bucket = False
                         for param in bucket.params:

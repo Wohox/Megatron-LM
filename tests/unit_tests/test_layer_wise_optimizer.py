@@ -11,8 +11,12 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    tag_params_for_buffer_routing,
+)
+from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
@@ -251,6 +255,89 @@ class TestLayerWiseOptimizer:
                         raise AssertionError(
                             f"Parameter {name} differs between rank 0 and rank {i}. {str(e)}"
                         ) from None
+
+    def test_hybrid_no_layout_keeps_non_layerwise_params_in_distopt(self):
+        """Hybrid path: Muon matrices use LayerWise; vector params use DistOpt buffers."""
+        module = SimpleModel().bfloat16().cuda()
+        module.requires_grad_(True)
+        tag_params_for_buffer_routing([module])
+
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=False,
+            overlap_param_gather=True,
+        )
+        all_params = [p for p in module.parameters() if p.requires_grad]
+        non_layer_wise_params = [
+            p for p in all_params if not getattr(p, 'is_managed_by_layer_wise_optimizer', False)
+        ]
+        full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            non_layer_wise_params,
+            bucket_size=None,
+            data_parallel_world_size=parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True
+            ),
+            ddp_config=ddp_config,
+            expert_data_parallel_world_size=parallel_state.get_expert_data_parallel_world_size(),
+        )
+
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config,
+            module,
+            full_param_layout=full_param_layout,
+        )
+        model.broadcast_params()
+
+        layer_wise_buffers = [
+            buffer
+            for buffer in model.buffers + model.expert_parallel_buffers
+            if getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+        ]
+        non_layer_wise_buffers = [
+            buffer
+            for buffer in model.buffers + model.expert_parallel_buffers
+            if not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+        ]
+        assert layer_wise_buffers
+        assert non_layer_wise_buffers
+        assert all(not buffer.ddp_config.use_distributed_optimizer for buffer in layer_wise_buffers)
+        assert all(not buffer.ddp_config.overlap_param_gather for buffer in layer_wise_buffers)
+        assert all(buffer.param_data is None for buffer in layer_wise_buffers)
+        assert all(buffer.numel == buffer.numel_unpadded for buffer in layer_wise_buffers)
+        assert all(buffer.ddp_config.use_distributed_optimizer for buffer in non_layer_wise_buffers)
+        assert all(buffer.ddp_config.overlap_param_gather for buffer in non_layer_wise_buffers)
+        assert all(buffer.param_data is not None for buffer in non_layer_wise_buffers)
+
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            clip_grad=1.0,
+            muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=True,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [model],
+            pg_collection=pg_collection,
+            use_gloo_process_groups=False,
+        )
+        assert isinstance(optimizer, ChainedOptimizer)
+        assert any(
+            isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+            for sub_optimizer in optimizer.chained_optimizers
+        )
+        assert any(
+            isinstance(sub_optimizer, DistributedOptimizer)
+            for sub_optimizer in optimizer.chained_optimizers
+        )
 
     def test_get_grad_norm(self):
         """Test LayerWiseDistributedOptimizer gradient norm computation."""
