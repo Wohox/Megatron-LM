@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from typing import Callable, List, Optional
 
 import torch
@@ -21,6 +22,10 @@ from .optimizer import (
 from .optimizer_config import OptimizerConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _mib_from_numel(numel: int, element_size: int) -> float:
+    return numel * element_size / (1024 * 1024)
 
 
 def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
@@ -187,9 +192,44 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for groups, params in zip(param_groups, param_groups_this_rank):
             groups["params"] = params
 
+        if os.getenv("MCORE_DDP_LAYOUT_DUMP", "0") == "1":
+            self._log_shard_summary("dp_cp", self.dp_cp_params_list, self.pg_collection.dp_cp)
+            self._log_shard_summary("expt_dp", self.expt_dp_params_list, self.pg_collection.expt_dp)
+
         # simplify when expt_dp group size is 1 or expert parallel is off
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
+
+    def _log_shard_summary(self, label, params_list, group):
+        """Log per-rank LayerWise logical ownership for memory diagnostics."""
+        if params_list is None:
+            return
+        rank_numels = [sum(param.numel() for param in params) for params in params_list]
+        rank_param_counts = [len(params) for params in params_list]
+        if not rank_numels:
+            return
+        local_rank = get_pg_rank(group)
+        max_rank = max(range(len(rank_numels)), key=lambda idx: rank_numels[idx])
+        min_rank = min(range(len(rank_numels)), key=lambda idx: rank_numels[idx])
+        local_params = params_list[local_rank] if local_rank < len(params_list) else []
+        dtype_numels = {}
+        for param in local_params:
+            dtype_numels[param.dtype] = dtype_numels.get(param.dtype, 0) + param.numel()
+        dtype_summary = ", ".join(
+            f"{dtype}:{numel} elts/{_mib_from_numel(numel, torch.tensor([], dtype=dtype).element_size()):.2f} MiB"
+            for dtype, numel in sorted(dtype_numels.items(), key=lambda item: str(item[0]))
+        )
+        logger.info(
+            "LayerWise optimizer shard summary: "
+            f"group={label}, rank={local_rank}/{get_pg_size(group)}, "
+            f"total_params={sum(rank_param_counts)}, total_numel={sum(rank_numels)}, "
+            f"local_params={rank_param_counts[local_rank]}, local_numel={rank_numels[local_rank]}, "
+            f"min_rank={min_rank}:{rank_numels[min_rank]} elts, "
+            f"max_rank={max_rank}:{rank_numels[max_rank]} elts, "
+            f"max_rank_bf16={_mib_from_numel(rank_numels[max_rank], 2):.2f} MiB, "
+            f"max_rank_fp32={_mib_from_numel(rank_numels[max_rank], 4):.2f} MiB, "
+            f"local_dtype_breakdown=[{dtype_summary}]"
+        )
 
     def set_bucket_layerwise_params_list(self, model_chunks):
         """Map sharded params to DDP buckets for async all-gather.

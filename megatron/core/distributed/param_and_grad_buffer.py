@@ -4,6 +4,7 @@ import fnmatch
 import functools
 import logging
 import math
+import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -33,6 +34,13 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
+
+
+def _mib_from_tensor(tensor: Optional[torch.Tensor]) -> float:
+    """Return tensor storage size in MiB for diagnostic logging."""
+    if tensor is None:
+        return 0.0
+    return tensor.numel() * tensor.element_size() / (1024 * 1024)
 
 try:
     if is_torch_min_version("1.13.0"):
@@ -1217,6 +1225,47 @@ class _ParamAndGradBuffer:
             )
         # Log buckets for all PP stages.
         log_strs = []
+        if os.getenv("MCORE_DDP_LAYOUT_DUMP", "0") == "1":
+            owner_tags = [
+                getattr(param, 'is_managed_by_layer_wise_optimizer', None)
+                for param in self.params
+            ]
+            if owner_tags and all(tag is True for tag in owner_tags):
+                owner = "layerwise_tagged"
+            elif owner_tags and all(tag is False for tag in owner_tags):
+                owner = "distopt_fallback_tagged"
+            elif owner_tags and any(tag is not None for tag in owner_tags):
+                owner = "mixed_tagged"
+            elif self.ddp_config.overlap_param_gather and not self.ddp_config.use_distributed_optimizer:
+                owner = "layerwise_untagged"
+            else:
+                owner = "untagged"
+            extra_main_grad_mib = sum(_mib_from_tensor(tensor) for tensor in self.extra_main_grads)
+            has_shared_mxfp8_buffer = getattr(self, 'shared_buffer', None) is not None
+            physical_unique_mib = (
+                _mib_from_tensor(self.shared_buffer)
+                if has_shared_mxfp8_buffer
+                else _mib_from_tensor(self.param_data) + _mib_from_tensor(self.grad_data)
+            )
+            physical_unique_mib += extra_main_grad_mib
+            log_strs.append(
+                "DDP buffer summary: "
+                f"owner={owner}, "
+                f"param_dtype={self.param_dtype}, grad_dtype={self.grad_dtype}, "
+                f"params={len(self.params)}, buckets={len(self.buckets)}, "
+                f"dp_world_size={self.data_parallel_world_size}, "
+                f"use_distributed_optimizer={self.ddp_config.use_distributed_optimizer}, "
+                f"overlap_param_gather={self.ddp_config.overlap_param_gather}, "
+                f"reuse_grad_buf_for_mxfp8_param_ag="
+                f"{self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag}, "
+                f"numel_unpadded={self.numel_unpadded}, numel_padded={self.numel}, "
+                f"padding_numel={self.numel - self.numel_unpadded}, "
+                f"param_buffer={_mib_from_tensor(self.param_data):.2f} MiB, "
+                f"grad_buffer={_mib_from_tensor(self.grad_data):.2f} MiB, "
+                f"extra_main_grad={extra_main_grad_mib:.2f} MiB, "
+                f"physical_unique={physical_unique_mib:.2f} MiB, "
+                f"shared_mxfp8_buffer={has_shared_mxfp8_buffer}"
+            )
         log_strs.append(
             f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"
         )
