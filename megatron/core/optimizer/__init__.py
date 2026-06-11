@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import os
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
@@ -87,6 +88,10 @@ from .optimizer_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _mib_from_numel(numel: int, element_size: int) -> float:
+    return numel * element_size / (1024 * 1024)
 
 
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
@@ -789,6 +794,30 @@ def _get_megatron_emerging_optimizer(
         opt_name = group.get('optimizer', eopt_name)
         is_expert = group['is_expert_parallel'] and not use_layer_wise
         grouped_param_groups[(opt_name, is_expert)].append(group)
+
+    if os.getenv("MCORE_DDP_LAYOUT_DUMP", "0") == "1":
+        for (opt_name, is_expert), groups in grouped_param_groups.items():
+            params = [param for group in groups for param in group['params']]
+            dtype_numels = defaultdict(int)
+            for param in params:
+                dtype_numels[param.dtype] += param.numel()
+            dtype_summary = ", ".join(
+                f"{dtype}:{numel} elts/{_mib_from_numel(numel, torch.empty((), dtype=dtype).element_size()):.2f} MiB"
+                for dtype, numel in sorted(dtype_numels.items(), key=lambda item: str(item[0]))
+            )
+            layerwise_managed = sum(
+                1 for param in params if getattr(param, 'is_managed_by_layer_wise_optimizer', False)
+            )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "Optimizer param-group summary: "
+                f"optimizer={opt_name}, is_expert_parallel={is_expert}, "
+                f"groups={len(groups)}, params={len(params)}, "
+                f"numel={sum(param.numel() for param in params)}, "
+                f"layerwise_managed_params={layerwise_managed}, "
+                f"dtype_breakdown=[{dtype_summary}]",
+            )
 
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     results = []

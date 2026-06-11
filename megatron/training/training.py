@@ -296,6 +296,24 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
+def _memory_phase_dump_enabled():
+    return (
+        os.getenv("MCORE_MEMORY_PHASE_DUMP", "0") == "1"
+        or os.getenv("MCORE_DDP_LAYOUT_DUMP", "0") == "1"
+    )
+
+
+def _report_memory_phase(name):
+    """Log CUDA memory at coarse setup/train phases for memory A/B diagnostics."""
+    if not _memory_phase_dump_enabled():
+        return
+    if not torch.cuda.is_available():
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    report_memory(f'(memory probe: {name})')
+
+
 def num_floating_point_operations(args, batch_size):
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
@@ -1258,6 +1276,7 @@ def pretrain(
     )
 
     timers('model-and-optimizer-setup').stop()
+    _report_memory_phase("after model-and-optimizer setup timer")
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
 
@@ -1899,6 +1918,7 @@ def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_con
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
+    _report_memory_phase("after model/ddp setup")
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics(
@@ -1932,7 +1952,9 @@ def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_con
             use_gloo_process_groups=args.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
+        _report_memory_phase("after optimizer setup")
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        _report_memory_phase("after optimizer scheduler setup")
 
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
@@ -3483,6 +3505,8 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
+            if _memory_phase_dump_enabled() and iteration - start_iteration < 4:
+                _report_memory_phase(f"before train_step iteration {iteration + 1}")
             (
                 loss_dict,
                 skipped_iter,
@@ -3502,6 +3526,8 @@ def train(
                 forward_backward_func,
                 iteration=iteration,
             )
+            if _memory_phase_dump_enabled() and iteration - start_iteration < 4:
+                _report_memory_phase(f"after train_step iteration {iteration + 1}")
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()
