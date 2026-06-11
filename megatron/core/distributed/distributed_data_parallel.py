@@ -149,14 +149,15 @@ class DistributedDataParallel(_BaseDataParallel):
                 expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
             )
 
-        # When a full_param_layout is provided, verify that the grouping is consistent
-        # with the layout (same buffer keys, same params per key, same param_indices).
+        # When a full_param_layout is provided, verify that the provided subset is consistent
+        # with the grouping. Buffers without an explicit layout use the default no-padding layout.
         if full_param_layout is not None:
-            assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
-                f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
-                f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
+            assert set(full_param_layout.layouts.keys()).issubset(set(buffer_groups.keys())), (
+                f"full_param_layout keys {set(full_param_layout.layouts.keys())} are not a "
+                f"subset of buffer keys from param grouping {set(buffer_groups.keys())}"
             )
-            for buffer_key, (params, param_indices) in buffer_groups.items():
+            for buffer_key in full_param_layout.layouts:
+                params, param_indices = buffer_groups[buffer_key]
                 layout = full_param_layout.layouts[buffer_key]
                 assert set(params) == set(
                     layout.param_index_map.keys()
