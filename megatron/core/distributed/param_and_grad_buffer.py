@@ -281,6 +281,12 @@ class _ParamAndGradBucketGroup:
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
+        if not self.ddp_config.use_distributed_optimizer:
+            # Legacy LayerWise no-layout sync gathers directly through the
+            # per-rank param lists and reuses grad_data as temporary receive
+            # storage. There is no param buffer to copy back from here.
+            return
+
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket in self.buckets:
                 is_bf16_weight_bucket = False
