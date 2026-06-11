@@ -326,6 +326,10 @@ class OptimizerConfig:
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
 
+    use_layer_wise_compact_ddp_layout: bool = False
+    """Use compact DistributedOptimizer-style DDP buffers while keeping LayerWise
+    whole-parameter ownership for emerging optimizers. Experimental."""
+
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
         This argument is intended to have the same value as the "overlap_param_gather" argument 

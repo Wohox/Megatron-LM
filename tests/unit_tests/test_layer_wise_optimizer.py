@@ -11,6 +11,7 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -81,6 +82,7 @@ class TestLayerWiseOptimizer:
         model_kwargs=None,
         use_layer_wise=True,
         copy_from=None,
+        fp8_recipe=None,
     ):
         """Create model, DDP wrapper, and optimizer.
 
@@ -118,6 +120,7 @@ class TestLayerWiseOptimizer:
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
+            fp8_recipe=fp8_recipe,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -125,6 +128,77 @@ class TestLayerWiseOptimizer:
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
         optimizer = get_megatron_optimizer(optimizer_config, [model], pg_collection=pg_collection)
+        return model, optimizer, pg_collection
+
+    def create_model_and_optimizer_with_compact_ddp_layout(
+        self,
+        model_class=SimpleModel,
+        clip_grad=1.0,
+        model_kwargs=None,
+        copy_from=None,
+        overlap_grad_reduce=True,
+        overlap_param_gather=False,
+        grad_reduce_in_fp32=False,
+        bucket_size=2000,
+        fp8_recipe=None,
+    ):
+        """Create model, compact-DDP DDP wrapper, and LayerWise optimizer."""
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        model = model_class(**model_kwargs).bfloat16().cuda()
+        model.requires_grad_(True)
+
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=overlap_grad_reduce,
+            overlap_param_gather=overlap_param_gather,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            bucket_size=bucket_size,
+        )
+        all_params = [param for param in model.parameters() if param.requires_grad]
+        full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            all_params,
+            bucket_size if overlap_grad_reduce else None,
+            parallel_state.get_data_parallel_world_size(with_context_parallel=True),
+            ddp_config,
+            expert_data_parallel_world_size=parallel_state.get_expert_data_parallel_world_size(),
+        )
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config,
+            model,
+            full_param_layout=full_param_layout,
+        )
+        if copy_from:
+            model.module.load_state_dict(copy_from.module.state_dict())
+        else:
+            model.broadcast_params()
+
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_distributed_optimizer=True,
+            clip_grad=clip_grad,
+            overlap_param_gather=overlap_param_gather,
+            muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_compact_ddp_layout=True,
+            fp8_recipe=fp8_recipe,
+        )
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            pg_collection=pg_collection,
+        )
         return model, optimizer, pg_collection
 
     def create_model_and_optimizer_with_overlap_param_gather(
@@ -521,6 +595,57 @@ class TestLayerWiseOptimizer:
         # Verify updated values match reference optimizer
         for param, ref_param in zip(model.parameters(), reference_model.parameters()):
             torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
+
+    def test_compact_ddp_layout_optimizer_ownership(self):
+        """Compact mode should shard optimizer state by logical whole-param owners."""
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_compact_ddp_layout()
+
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+        assert optimizer.use_compact_ddp_layout
+        assert all(buffer.param_data is not None for buffer in model.buffers)
+
+        dp_rank = get_pg_rank(pg_collection.dp_cp)
+        expected_local_param_ids = (
+            {id(param) for param in optimizer.dp_cp_params_list[dp_rank]}
+            if optimizer.dp_cp_params_list
+            else set()
+        )
+        actual_local_param_ids = set()
+        for sub_optimizer in optimizer.chained_optimizers:
+            if isinstance(sub_optimizer, Float16OptimizerWithFloat16Params):
+                for group in sub_optimizer.float16_groups:
+                    actual_local_param_ids.update(id(param) for param in group)
+
+        assert actual_local_param_ids == expected_local_param_ids
+
+    @pytest.mark.parametrize("fp8_recipe", [None, "mxfp8"])
+    def test_compact_ddp_layout_matches_legacy_layerwise_step(self, fp8_recipe):
+        """Compact BF16 and MXFP8 no-FP8PG paths should match legacy LayerWise math."""
+        compact_model, compact_optimizer, pg_collection = (
+            self.create_model_and_optimizer_with_compact_ddp_layout(fp8_recipe=fp8_recipe)
+        )
+        legacy_model, legacy_optimizer, _ = self.create_model_and_optimizer(
+            copy_from=compact_model,
+            fp8_recipe=fp8_recipe,
+        )
+
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        torch.distributed.broadcast(input_tensor, src=0, group=pg_collection.dp_cp)
+
+        compact_loss = compact_model(input_tensor).sum()
+        legacy_loss = legacy_model(input_tensor).sum()
+        compact_loss.backward()
+        legacy_loss.backward()
+        compact_model.finish_grad_sync()
+        legacy_model.finish_grad_sync()
+
+        compact_update_successful, _, _ = compact_optimizer.step()
+        legacy_update_successful, _, _ = legacy_optimizer.step()
+        assert compact_update_successful
+        assert legacy_update_successful
+
+        for param, legacy_param in zip(compact_model.parameters(), legacy_model.parameters()):
+            torch.testing.assert_close(param.data, legacy_param.data, rtol=1e-5, atol=1e-5)
 
     # ---- Overlap-param-gather tests ----
 

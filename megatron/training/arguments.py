@@ -1752,7 +1752,25 @@ def validate_args(args, defaults={}):
 
         if args.use_distributed_optimizer:
             args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
+            if not args.use_layer_wise_compact_ddp_layout:
+                args.use_distributed_optimizer = False
+
+        if args.use_layer_wise_compact_ddp_layout:
+            assert args.use_layer_wise_distributed_optimizer, (
+                "--use-layer-wise-compact-ddp-layout requires an emerging optimizer "
+                "using LayerWiseDistributedOptimizer"
+            )
+            assert args.use_distributed_optimizer, (
+                "--use-layer-wise-compact-ddp-layout requires --use-distributed-optimizer "
+                "so DDP allocates compact param/grad buffers"
+            )
+            assert not args.fp8_param_gather, (
+                "--use-layer-wise-compact-ddp-layout does not implement FP8 parameter gather"
+            )
+            assert not args.reuse_grad_buf_for_mxfp8_param_ag, (
+                "--use-layer-wise-compact-ddp-layout does not support "
+                "--reuse-grad-buf-for-mxfp8-param-ag yet"
+            )
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert (
@@ -3856,6 +3874,12 @@ def _add_distributed_args(parser):
     )
     group.add_argument(
         '--use-distributed-optimizer', action='store_true', help='Use distributed optimizer.'
+    )
+    group.add_argument(
+        '--use-layer-wise-compact-ddp-layout',
+        action='store_true',
+        help='Experimental: use compact DistributedOptimizer-style DDP param/grad buffers with '
+        'LayerWise whole-parameter optimizer ownership for emerging optimizers.',
     )
     group.add_argument(
         '--use-nccl-ub',

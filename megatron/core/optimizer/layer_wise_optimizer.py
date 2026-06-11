@@ -1,7 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from typing import Callable, List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -11,6 +12,7 @@ from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, S
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
 
+from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, dist_all_gather_func
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
     ChainedOptimizer,
@@ -23,20 +25,63 @@ from .optimizer_config import OptimizerConfig
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class LayerWiseParamOwnership:
+    """Whole-parameter ownership for LayerWise optimizer state."""
+
+    param_to_owner_rank: Dict[torch.nn.Parameter, int]
+    owner_rank_to_params: List[List[torch.nn.Parameter]]
+    owner_rank_loads: List[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _CompactParamBufferInfo:
+    buffer: _ParamAndGradBuffer
+    param_start: int
+    param_end: int
+    bucket_id: int
+
+
+def compute_layer_wise_param_ownership(
+    params: Iterable[torch.nn.Parameter], world_size: int
+) -> LayerWiseParamOwnership:
+    """Assign whole params to logical LayerWise owner ranks using LPT bin packing."""
+    assert world_size >= 1
+    owner_rank_to_params: List[List[torch.nn.Parameter]] = [[] for _ in range(world_size)]
+    owner_rank_loads = [0 for _ in range(world_size)]
+    param_to_owner_rank: Dict[torch.nn.Parameter, int] = {}
+
+    indexed_params = list(enumerate(params))
+    indexed_params.sort(key=lambda item: (-item[1].numel(), item[0]))
+    for _, param in indexed_params:
+        owner_rank = min(range(world_size), key=lambda rank: (owner_rank_loads[rank], rank))
+        owner_rank_to_params[owner_rank].append(param)
+        owner_rank_loads[owner_rank] += param.numel()
+        param_to_owner_rank[param] = owner_rank
+
+    return LayerWiseParamOwnership(
+        param_to_owner_rank=param_to_owner_rank,
+        owner_rank_to_params=owner_rank_to_params,
+        owner_rank_loads=owner_rank_loads,
+    )
+
+
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
     Experimental distributed optimizer wrapper that distributes weight to DP ranks by layer.
     Implemented as ChainedOptimizer to support multiple optimizers (e.g. muon + adamW)
-    When using, keep all megatron distributed-optimizer related options OFF.
+    Legacy mode uses full DDP gradients and LayerWise param all-gather. Compact-DDP mode
+    keeps DDP's DistributedOptimizer-style compact param/grad buffers while retaining
+    whole-parameter LayerWise optimizer ownership.
 
     How LayerWiseDistributedOptimizer work:
-    1. weights are splited into lists and each rank only keep its shard in its optimizer
-    2. Megatron DDP handle allreduce grad, note that each rank have full model and grad
-    3. optimizer is already modified so only param belong to this DP rank is updated
-    4. grad_norm and zero counting will reduce metrics globally in step function
-    5. Do regular update with chained optimizers, modified optimizer only update shard
-    6. allgather updated params to every rank
+    1. weights are split into lists and each rank only keeps its shard in its optimizer
+    2. DDP reduces gradients; compact mode reconstructs logical-owner full grads after RS
+    3. optimizer is modified so only params that belong to this DP rank are updated
+    4. grad_norm and zero counting reduce metrics globally in step
+    5. regular chained optimizers update the local logical-owner params
+    6. updated params are gathered or staged back into compact DDP shards, then all-gathered
     """
 
     def __init__(
@@ -59,11 +104,42 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
+        model_chunks = model_chunks or []
+        self.model_chunks = model_chunks
+        self.use_compact_ddp_layout = config.use_layer_wise_compact_ddp_layout
+        if self.use_compact_ddp_layout:
+            assert self.pg_collection is not None, "pg_collection is required for compact LayerWise"
+            assert model_chunks, "model_chunks are required for compact LayerWise"
+            if config.reuse_grad_buf_for_mxfp8_param_ag:
+                raise NotImplementedError(
+                    "LayerWise compact DDP layout does not yet support "
+                    "reuse_grad_buf_for_mxfp8_param_ag / FP8 parameter gather."
+                )
+            for model_chunk in model_chunks:
+                assert model_chunk.ddp_config.use_distributed_optimizer, (
+                    "LayerWise compact DDP layout requires DDP use_distributed_optimizer=True"
+                )
+                if model_chunk.ddp_config.fp8_param_gather:
+                    raise NotImplementedError(
+                        "LayerWise compact DDP layout does not implement FP8 parameter gather."
+                    )
+                if model_chunk.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                    raise NotImplementedError(
+                        "LayerWise compact DDP layout does not support "
+                        "reuse_grad_buf_for_mxfp8_param_ag / FP8 parameter gather."
+                    )
+                assert model_chunk.ddp_config.num_distributed_optimizer_instances == 1, (
+                    "LayerWise compact DDP layout currently supports one distributed optimizer "
+                    "instance per data-parallel group"
+                )
         self.shard_params(optimizers)
+        self._compact_param_buffer_infos: Dict[torch.nn.Parameter, _CompactParamBufferInfo] = {}
+        if self.use_compact_ddp_layout:
+            self._build_compact_param_buffer_infos(model_chunks)
 
         # Set up overlap param gather using DDP bucket infrastructure.
         self.overlap_param_gather = config.overlap_param_gather
-        if self.overlap_param_gather:
+        if self.overlap_param_gather and not self.use_compact_ddp_layout:
             assert (
                 model_chunks is not None
             ), "model_chunks must be provided if overlap_param_gather is True"
@@ -90,6 +166,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 )
 
         super().__init__(optimizers)
+        self.model_chunks = model_chunks
 
         # TODO(kunlun, deyuf): potential future perf optimization
         # since allreduce is unchanged and handled by megatron DDP, they're already in
@@ -100,6 +177,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     def shard_params(self, optimizers):
         """Shard all params into lists by rank."""
+        if self.use_compact_ddp_layout:
+            self._shard_params_by_logical_ownership(optimizers)
+            return
+
         # list of parameter are sorted by numel and assigned to ranks in ping-pong style
         # example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list will be
         # [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]]
@@ -152,6 +233,164 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
+    def _shard_params_by_logical_ownership(self, optimizers):
+        """Shard optimizer param groups by whole-param logical ownership."""
+        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
+        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
+        dp_cp_rank = get_pg_rank(self.pg_collection.dp_cp)
+        expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
+
+        param_groups = []
+        for optimizer in optimizers:
+            param_groups += optimizer.param_groups
+
+        dense_entries = []
+        expert_entries = []
+        for group_index, group in enumerate(param_groups):
+            for param in group["params"]:
+                entry = (param, group_index)
+                if group.get("is_expert_parallel", False):
+                    expert_entries.append(entry)
+                else:
+                    dense_entries.append(entry)
+
+        dense_ownership = compute_layer_wise_param_ownership(
+            [param for param, _ in dense_entries], dp_cp_size
+        )
+        expert_ownership = compute_layer_wise_param_ownership(
+            [param for param, _ in expert_entries], expt_dp_size
+        )
+        self.dp_cp_ownership = dense_ownership
+        self.expt_dp_ownership = expert_ownership
+        self.dp_cp_params_list = dense_ownership.owner_rank_to_params
+        self.expt_dp_params_list = expert_ownership.owner_rank_to_params
+
+        param_groups_this_rank = [[] for _ in param_groups]
+        for param, group_index in dense_entries:
+            if dense_ownership.param_to_owner_rank[param] == dp_cp_rank:
+                param_groups_this_rank[group_index].append(param)
+        for param, group_index in expert_entries:
+            if expert_ownership.param_to_owner_rank[param] == expt_dp_rank:
+                param_groups_this_rank[group_index].append(param)
+
+        for group, params in zip(param_groups, param_groups_this_rank):
+            group["params"] = params
+
+        if dp_cp_size == 1:
+            self.dp_cp_params_list = None
+        if expt_dp_size == 1 or len(expert_entries) == 0:
+            self.expt_dp_params_list = None
+
+    def _build_compact_param_buffer_infos(self, model_chunks):
+        """Index DDP compact param-buffer locations by model parameter."""
+        for model_chunk in model_chunks:
+            for buffer in model_chunk.buffers + model_chunk.expert_parallel_buffers:
+                for param, (param_start, param_end, bucket_id) in buffer.param_index_map.items():
+                    self._compact_param_buffer_infos[param] = _CompactParamBufferInfo(
+                        buffer=buffer,
+                        param_start=param_start,
+                        param_end=param_end,
+                        bucket_id=bucket_id,
+                    )
+
+    @staticmethod
+    def _local_shard_intersection(
+        param_start: int,
+        param_end: int,
+        bucket_start: int,
+        bucket_end: int,
+        rank: int,
+        world_size: int,
+    ) -> Optional[Tuple[int, int]]:
+        """Return the param/bucket intersection owned by ``rank`` in compact layout."""
+        assert (bucket_end - bucket_start) % world_size == 0
+        shard_numel = (bucket_end - bucket_start) // world_size
+        shard_start = bucket_start + rank * shard_numel
+        shard_end = shard_start + shard_numel
+        start = max(param_start, shard_start)
+        end = min(param_end, shard_end)
+        if start >= end:
+            return None
+        return start, end
+
+    def _all_gather_compact_grad_bucket_groups(self, bucket_groups):
+        """Reconstruct full reduced grad buffers from compact reduce-scatter shards."""
+        for bucket_group in bucket_groups:
+            group = bucket_group.intra_distributed_optimizer_instance_group
+            rank = bucket_group.intra_distributed_optimizer_instance_rank
+            world_size = bucket_group.intra_distributed_optimizer_instance_size
+            for bucket in bucket_group.buckets:
+                local_shard = bucket.grad_data.chunk(world_size)[rank]
+                dist_all_gather_func(bucket.grad_data, local_shard, group=group)
+                for param in bucket.params_with_extra_main_grads:
+                    if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
+                        param.main_grad.copy_(param.main_grad_copy_in_grad_buffer)
+
+    @torch.no_grad()
+    def redispatch_grads_from_compact_buffers(self) -> None:
+        """Make compact DDP reduce-scattered grads visible to logical LayerWise owners."""
+        if not self.use_compact_ddp_layout:
+            return
+        # Phase 1 correctness path: reconstruct compact reduced grad buffers on all
+        # ranks using the existing full compact buffer storage. This oversends versus
+        # owner-only routing but avoids LayerWise padding and leaves optimizer state
+        # sharded by logical whole-param ownership.
+        for model_chunk in self.model_chunks:
+            self._all_gather_compact_grad_bucket_groups(model_chunk.bucket_groups)
+            self._all_gather_compact_grad_bucket_groups(model_chunk.expert_parallel_bucket_groups)
+
+    def _redispatch_updated_params_for_ownership(self, params_list, group):
+        """Stage updated whole params into this rank's compact DDP param-buffer shard."""
+        if not params_list:
+            return
+        rank = get_pg_rank(group)
+        world_size = get_pg_size(group)
+        for owner_rank, params in enumerate(params_list):
+            if not params:
+                continue
+            src_global_rank = torch.distributed.get_global_rank(group, owner_rank)
+            for param in params:
+                info = self._compact_param_buffer_infos[param]
+                buffer = info.buffer
+                bucket_start, bucket_end = buffer.bucket_indices[info.bucket_id]
+                intersection = self._local_shard_intersection(
+                    info.param_start,
+                    info.param_end,
+                    bucket_start,
+                    bucket_end,
+                    rank,
+                    world_size,
+                )
+
+                if rank == owner_rank:
+                    full_param = param.data.detach()
+                else:
+                    full_param = torch.empty_like(param.data)
+                # Phase 1 correctness path: broadcast each logical-owner full param,
+                # then copy only the slice owned by this rank's compact DDP shard.
+                torch.distributed.broadcast(full_param, src_global_rank, group=group)
+
+                if intersection is None:
+                    continue
+                start, end = intersection
+                src_start = start - info.param_start
+                src_end = end - info.param_start
+                buffer.param_data.view(-1)[start:end].copy_(
+                    full_param.view(-1)[src_start:src_end]
+                )
+
+    @torch.no_grad()
+    def redispatch_updated_params_to_compact_buffers(self) -> None:
+        """Stage logical-owner updates into compact DDP shards before param all-gather."""
+        if not self.use_compact_ddp_layout:
+            return
+        self._redispatch_updated_params_for_ownership(
+            self.dp_cp_params_list, self.pg_collection.dp_cp
+        )
+        self._redispatch_updated_params_for_ownership(
+            self.expt_dp_params_list, self.pg_collection.expt_dp
+        )
+
     def set_bucket_layerwise_params_list(self, model_chunks):
         """Map sharded params to DDP buckets for async all-gather.
 
@@ -194,6 +433,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     @torch.no_grad()
     def allgather_params(self) -> None:
         """All-gather updated params from all ranks."""
+        if self.use_compact_ddp_layout:
+            for model_chunk in self.model_chunks:
+                model_chunk.start_param_sync(force_sync=True)
+            return
 
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
@@ -283,10 +526,24 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # All gather updated params. If overlap_param_gather is True, the allgather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
-        if not self.overlap_param_gather:
+        if update_successful and not self.overlap_param_gather:
             self.allgather_params()
 
         return update_successful, grad_norm, num_zeros_in_grad
+
+    @torch.no_grad()
+    def prepare_grads(self) -> bool:
+        """Prepare logical-owner gradients before the chained optimizers read them."""
+        self.redispatch_grads_from_compact_buffers()
+        return super().prepare_grads()
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Step local logical-owner params and stage compact DDP param shards."""
+        success = super().step_with_ready_grads()
+        if success:
+            self.redispatch_updated_params_to_compact_buffers()
+        return success
 
     # TODO(deyuf): need to improve dist checkpointing design to properly handle this
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty
