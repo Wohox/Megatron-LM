@@ -3285,6 +3285,16 @@ def _add_regularization_args(parser):
         help='How to perform NS calculation for tensor model parallel weights',
     )
     group.add_argument(
+        '--muon-use-syrk',
+        action='store_true',
+        default=False,
+        dest='muon_use_syrk',
+        help='Route the Muon Newton-Schulz iteration through the Triton SYRK kernel '
+        '(triton_kernels.tsyrk_ex) instead of dense matmuls. Only takes effect when '
+        '--muon-fp32-matmul-prec is "medium". Used to A/B test SYRK throughput vs. '
+        'loss against the dense path.',
+    )
+    group.add_argument(
         '--muon-extra-scale-factor',
         type=float,
         default=1.0,

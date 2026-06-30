@@ -28,7 +28,10 @@ try:
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        NSCoeffT,
+        newton_schulz,
+    )
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
@@ -39,9 +42,21 @@ except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
     AdaptiveMuon = object
+    newton_schulz = None
 
 
 logger = logging.getLogger(__name__)
+
+
+# Whether the installed ``emerging_optimizers.newton_schulz`` exposes the
+# ``use_syrk`` argument. The Triton SYRK kernel (``newton_schulz_step_tsyrk`` /
+# ``triton_kernels.tsyrk_ex``) lives inside the package, but only the base
+# ``newton_schulz`` accepts ``use_syrk``; the upstream ``newton_schulz_tp``
+# wrapper drops it. We reimplement the wrapper below (see ``newton_schulz_tp``)
+# to thread the flag through, and use this check to fail loudly on older builds.
+_NEWTON_SCHULZ_SUPPORTS_SYRK = HAVE_EMERGING_OPTIMIZERS and (
+    "use_syrk" in inspect.signature(newton_schulz).parameters
+)
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -130,6 +145,109 @@ def _is_nonlinear_or_embedding(param):
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
 
 
+def _syrk_compatible(t: torch.Tensor) -> bool:
+    """Whether *t* satisfies the Triton SYRK kernel's 16-byte stride-alignment requirement.
+
+    ``triton_kernels.tsyrk_ex`` constructs ``TensorDescriptor``s for the bf16/fp32 input and
+    output matrices; Triton asserts that the (non-contiguous) descriptor strides are 16-byte
+    aligned. For 2-byte (bf16) and 4-byte (fp32) elements that requires the leading matrix
+    dim — i.e. each of the last two sizes of a contiguous matrix — to be a multiple of 8.
+    Matrices that violate this (e.g. tiny hyper-connection weights) must use the dense path.
+    """
+    return t.shape[-1] % 8 == 0 and t.shape[-2] % 8 == 0
+
+
+def newton_schulz_tp(
+    x: torch.Tensor,
+    steps: int,
+    coefficient_type: str,
+    tp_group: torch.distributed.ProcessGroup,
+    partition_dim: int | None = None,
+    tp_mode: str = "duplicated",
+    use_syrk: bool = False,
+) -> torch.Tensor:
+    """Tensor-parallel Newton-Schulz iteration with optional SYRK acceleration.
+
+    Local Megatron reimplementation of
+    ``emerging_optimizers.orthogonalized_optimizers.muon_utils.newton_schulz_tp``.
+    The only functional difference is that we thread ``use_syrk`` through to the
+    base ``newton_schulz`` call in every path (non-TP fallback, ``duplicated``,
+    ``distributed``). Upstream's wrapper accepts no ``use_syrk`` argument, so the
+    Triton SYRK kernel (``triton_kernels.tsyrk_ex``) is never reachable through
+    the TP path. ``use_syrk`` only takes effect when the fp32 matmul precision is
+    ``"medium"`` (the default for Muon); see the base ``newton_schulz``.
+
+    Args:
+        x: The tensor to orthogonalize (the momentum buffer).
+        steps: Number of Newton-Schulz iterations.
+        coefficient_type: Coefficient set for the iteration.
+        tp_group: Tensor-parallel process group (used when the tensor is sharded).
+        partition_dim: Dimension along which ``x`` is sharded; ``None`` for the
+            non-TP fallback path.
+        tp_mode: ``"duplicated"`` (all-gather then orthogonalize a replicated copy)
+            or ``"distributed"`` (orthogonalize the local shard with TP all-reduce).
+        use_syrk: Route Newton-Schulz steps through the Triton SYRK kernel, subject to
+            the kernel's alignment requirement (see ``_syrk_compatible``); incompatible
+            matrices transparently fall back to the dense path.
+
+    Returns:
+        The orthogonalized tensor with the same shape/sharding as ``x``.
+    """
+    if use_syrk and not _NEWTON_SCHULZ_SUPPORTS_SYRK:
+        raise RuntimeError(
+            "muon_use_syrk=True requires an emerging_optimizers build whose "
+            "newton_schulz() accepts a 'use_syrk' argument (e.g. "
+            "Emerging-Optimizers main / NVIDIA/Megatron-LM PR #5470). "
+            "The installed build does not expose it."
+        )
+
+    def _ns(t: torch.Tensor, **extra: Any) -> torch.Tensor:
+        """Call the base newton_schulz on *t*, enabling SYRK only when *t* is compatible.
+
+        The Triton ``tsyrk_ex`` kernel builds ``TensorDescriptor``s whose matrix strides
+        must be 16-byte aligned, which for its bf16/fp32 operands requires both matrix
+        dims to be multiples of 8. Tiny/unaligned Muon weights (e.g. DSV4 hyper-connection
+        matrices, ``num_residual_streams``-sized dims) would trip "strides must be 16-byte
+        aligned", so they fall back to the dense path while large aligned weights — where
+        SYRK actually helps — keep the kernel.
+        """
+        kw = dict(extra)
+        if use_syrk:
+            if _syrk_compatible(t):
+                kw["use_syrk"] = True
+            else:
+                log_single_rank(
+                    logger,
+                    logging.DEBUG,
+                    f'muon_use_syrk: dense fallback for shape {tuple(t.shape)} '
+                    '(SYRK kernel requires both matrix dims % 8 == 0).',
+                )
+        return newton_schulz(t, steps, coefficient_type, **kw)
+
+    if partition_dim is None:
+        # Non-TP fallback path (also covers tp_size == 1).
+        return _ns(x)
+
+    if tp_mode == "duplicated":
+        x_shards = [torch.empty_like(x) for _ in range(tp_group.size())]
+        torch.distributed.all_gather(x_shards, x, tp_group)
+        global_x = torch.cat(x_shards, dim=partition_dim)
+        orthogonalized_x = _ns(global_x, tp_group=None)
+        output = orthogonalized_x.chunk(tp_group.size(), dim=partition_dim)[tp_group.rank()]
+    elif tp_mode == "distributed":
+        if partition_dim == 0:
+            transpose = True
+        elif partition_dim == 1:
+            transpose = False
+        else:
+            raise ValueError(f"Invalid partition_dim: {partition_dim}")
+        output = _ns(x, transpose=transpose, tp_group=tp_group)
+    else:
+        raise ValueError(f"Invalid tp_mode: {tp_mode}")
+
+    return output
+
+
 def _get_qkv_split_shapes(model_cfg) -> list[int]:
     """Compute QKV split shapes from model config."""
     query_projection_size = (
@@ -178,6 +296,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_syrk: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -192,7 +311,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 logging.DEBUG,
                 f'Orthogonalizing grad with {num_ns_steps} steps, '
                 f'{coefficient_type} coefficient, '
-                f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
+                f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}, '
+                f'use_syrk={use_syrk}',
             )
             size = [grad.size(-2), grad.size(-1)]
             if partition_dim is not None:
@@ -204,6 +324,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 tp_group=tp_group,
                 partition_dim=partition_dim,
                 tp_mode="duplicated" if tp_mode == "blockwise" else tp_mode,
+                use_syrk=use_syrk,
             )
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
@@ -317,6 +438,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         extra_scale_factor: The additional scale factor to use for the update.
         pg_collection: Process group collection for distributed training.
         tp_mode: Tensor parallel mode ("blockwise", "duplicated", or "distributed").
+        use_syrk: Route Newton-Schulz steps through the Triton SYRK kernel (only
+            active when fp32_matmul_prec == "medium").
         moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
         beta2: The exponential decay rate for second moment.
         eps: Small constant for numerical stability.
@@ -340,6 +463,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_syrk: bool = False,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -362,6 +486,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             extra_scale_factor=extra_scale_factor,
             pg_collection=pg_collection,
             tp_mode=tp_mode,
+            use_syrk=use_syrk,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor

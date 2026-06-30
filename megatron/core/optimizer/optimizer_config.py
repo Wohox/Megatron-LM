@@ -281,6 +281,11 @@ class OptimizerConfig:
     muon_tp_mode: str = "blockwise"
     """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
 
+    muon_use_syrk: bool = False
+    """Whether to route the Newton-Schulz iteration through the Triton SYRK kernel
+    (``triton_kernels.tsyrk_ex``) instead of dense matmuls. Only takes effect when
+    ``muon_fp32_matmul_prec == "medium"``. Defaults to False."""
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
