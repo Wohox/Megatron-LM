@@ -41,12 +41,15 @@ def has_nvrx_async_support() -> bool:
         getattr(state_dict_saver, "save_state_dict_async_finalize", None),
         getattr(state_dict_saver, "save_state_dict_async_plan", None),
     )
-    assert (
+    # This is a boolean capability probe (HAVE_NVRX = has_nvrx_async_support() runs at
+    # megatron.core import time), so an installed-but-too-old nvrx must report "unsupported"
+    # rather than crash the import with an AssertionError. Fold the version check into the
+    # returned conjunction so old builds yield False and Megatron falls back to the standard
+    # checkpoint path.
+    return (
         is_nvrx_min_version()
-    ), f"Minimum required nvidia-resiliency-ext package version is {NVRX_MIN_VERSION}."
-
-    return all(symbol is not None for symbol in required_symbols) and hasattr(
-        filesystem_async, "_results_queue"
+        and all(symbol is not None for symbol in required_symbols)
+        and hasattr(filesystem_async, "_results_queue")
     )
 
 
