@@ -15,7 +15,11 @@ from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from ..fp8_utils import (
     _stage_param_to_bf16,
+    blockwise_fp8_direct_gather_supported,
     copy_back_gathered_bf16_into_fp8_param,
+    copy_gathered_blockwise_fp8_into_param,
+    get_blockwise_fp8_rowwise_tensors,
+    is_blockwise_float8tensor,
     is_float8tensor,
     post_all_gather_processing,
 )
@@ -419,11 +423,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # Engage FP8 param sync automatically when the decouple-managed params are actually
         # quantized (fp8_param_gather on + TE Float8/MXFP8 weights). Off -> plain bf16 path.
-        # Also tag the gathered fp8 params: the fp8 all-gather (``_allgather_helper_fp8``)
-        # requantizes bf16 -> each rank's fp8 ``param.data``, so the child optimizer's pre-gather
-        # fp8 copy-back into ``param.data`` is redundant for them and is skipped. Params in these
-        # per-rank lists are all-gathered (dp_cp / expt_dp size > 1 here); non-gathered fp8 params
-        # (e.g. expt_dp == 1 experts, which are absent from these lists) still need the copy-back.
+        #
+        # Tagging (``_layer_wise_fp8_gathered``) skips the child optimizer's pre-gather fp8
+        # copy-back into ``param.data``. Only the **bf16-staged** transport is tagged: it
+        # requantizes ``Q(bf16(master))`` into every rank's ``param.data`` during the gather, so
+        # the pre-gather copy-back would be redundant. The **blockwise rowwise-direct** transport
+        # instead gathers the owner's already-quantized ``_rowwise_data`` without requantizing, so
+        # the owner MUST keep the copy-back (quantize during the optimizer step, the synchronous
+        # phase) -- doing it inside ``start_param_sync`` would sync against the in-flight param
+        # all-gather and deadlock. Non-gathered fp8 params (e.g. expt_dp == 1 experts, absent from
+        # these per-rank lists) are also untagged and get their ``Q(bf16(master))`` in the step.
         self.use_fp8_param_sync = False
         if self.decouple_ddp_layout:
             for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
@@ -433,7 +442,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     for p in per_rank:
                         if is_float8tensor(p):
                             self.use_fp8_param_sync = True
-                            p._layer_wise_fp8_gathered = True
+                            if not is_blockwise_float8tensor(p):
+                                p._layer_wise_fp8_gathered = True
 
         # When a full_param_layout is available (and we are not decoupling),
         # ddp_config.use_distributed_optimizer is True and model params are views into the
@@ -751,21 +761,92 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         standard distributed optimizer buffer all-gather (via
         ``start_param_sync``) replaces this flatten/unflatten path.
 
-        Two transport variants share the same uneven (all-gather-v) shape:
+        Three transport variants share the same uneven (all-gather-v) shape:
 
         * **bf16** (``use_fp8_param_sync=False``): all-gather owned bf16 ``param.data``, copy_ into
           non-owned params.
-        * **fp8** (``use_fp8_param_sync=True``): stage owned fp32 master->bf16, all-gather bf16,
-          requantize into EVERY rank's ``param.data`` (owned included) so all hold
-          ``Q(bf16(master))`` (== OFF/Adam). Then ``post_all_gather_processing`` rebuilds fp8
-          columnwise/transpose (blockwise/Float8; mxfp8 noop since copy-back already forced it).
+        * **fp8 bf16-staged** (``use_fp8_param_sync=True``, mxfp8/mixed buffer): stage owned fp32
+          master->bf16, all-gather bf16, requantize into EVERY rank's ``param.data`` (owned
+          included) so all hold ``Q(bf16(master))`` (== OFF/Adam). Then
+          ``post_all_gather_processing`` rebuilds fp8 columnwise/transpose (mxfp8 noop since
+          copy-back already forced it).
+        * **fp8 rowwise-direct** (``use_fp8_param_sync=True``, all-blockwise buffer): all-gather
+          the owner's already-quantized ``_rowwise_data`` (uint8) + ``_rowwise_scale_inv`` (fp32)
+          — ~2x less comm than bf16 (the owner's fp8 was written by the optimizer step's
+          copy-back, since blockwise params are untagged). Non-owners install the gathered rowwise
+          tensors and ``post_all_gather_processing`` rebuilds columnwise as a pure transpose.
+          Bitwise-equal to the bf16-staged path because whole-param ownership makes the owner's
+          per-block quantization complete/local.
         """
 
-        # FP8-aware variant: stage bf16, uneven all-gather bf16, requantize per rank.
+        # FP8 rowwise-direct variant (blockwise only): all-gather the owner's quantized rowwise
+        # data + scale_inv, install on non-owners, rebuild columnwise. See docstring.
+        def _allgather_helper_blockwise_fp8(params_list, group):
+            rank = get_pg_rank(group)
+            dp_size = get_pg_size(group)
+            device = next((params[0].device for params in params_list if len(params) > 0), None)
+            if device is None:
+                # No rank owns any param in this buffer -> nothing to gather.
+                return
+
+            # The owner's fp8 rowwise storage is already current from the optimizer step's
+            # copy-back (blockwise params are untagged, so the step quantizes Q(bf16(master))).
+            # Just read (rowwise data, rowwise scale_inv) to broadcast -- no quantize here.
+            owned_data, owned_scale = [], []
+            for p in params_list[rank]:
+                d, s = get_blockwise_fp8_rowwise_tensors(p)
+                owned_data.append(d)
+                owned_scale.append(s)
+
+            # Uneven (all-gather-v) transport over one tensor family (rowwise data or scale_inv).
+            # Per-rank sizes come from the param objects, identical on every rank, so buffers line
+            # up. ``owned`` is the owner's flat source; ``kind`` selects data (0) vs scale_inv (1).
+            def _gather(owned, kind, dtype):
+                sizes = [
+                    sum(get_blockwise_fp8_rowwise_tensors(p)[kind].numel() for p in params)
+                    for params in params_list
+                ]
+                src = (
+                    _flatten_dense_tensors(owned)
+                    if len(owned) > 0
+                    else torch.empty(0, device=device, dtype=dtype)
+                )
+                gather_list = [
+                    src if i == rank else torch.empty(sizes[i], device=device, dtype=dtype)
+                    for i in range(dp_size)
+                ]
+                torch.distributed.all_gather(gather_list, src, group=group)
+                return gather_list
+
+            data_gather = _gather(owned_data, 0, torch.uint8)
+            scale_gather = _gather(owned_scale, 1, torch.float32)
+
+            # Install the gathered rowwise tensors into non-owned params (owner already up to date).
+            for idx, params in enumerate(params_list):
+                if len(params) == 0 or idx == rank:
+                    continue
+                data_tmpls = [get_blockwise_fp8_rowwise_tensors(p)[0] for p in params]
+                scale_tmpls = [get_blockwise_fp8_rowwise_tensors(p)[1] for p in params]
+                gathered_data = _unflatten_dense_tensors(data_gather[idx], data_tmpls)
+                gathered_scale = _unflatten_dense_tensors(scale_gather[idx], scale_tmpls)
+                for model_p, g_data, g_scale in zip(params, gathered_data, gathered_scale):
+                    copy_gathered_blockwise_fp8_into_param(model_p, g_data, g_scale)
+
+            # Rebuild fp8 columnwise/transpose after the gather (pure transpose for blockwise).
+            fp8_params = [p for params in params_list for p in params]
+            if fp8_params:
+                post_all_gather_processing(fp8_params)
+
+        # FP8 bf16-staged variant: stage bf16, uneven all-gather bf16, requantize per rank.
         def _allgather_helper_fp8(params_list, group):
-            # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
-            # (~2x less comm) instead of bf16; mxfp8 must stay on bf16. See the matching TODO in
-            # ``_ParamAndGradBucketGroup.start_param_sync`` for the full rationale.
+            # Blockwise buffers gather the owner's fp8 rowwise data directly (~2x less comm);
+            # mxfp8/mixed buffers must round-trip through bf16 (columnwise can't be derived from
+            # rowwise for mxfp8). The predicate agrees across ranks, keeping collectives in step.
+            all_params = [p for params in params_list for p in params]
+            if blockwise_fp8_direct_gather_supported(all_params):
+                _allgather_helper_blockwise_fp8(params_list, group)
+                return
+
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Device from any non-empty owned list (rank 0 may own zero params in the layout).

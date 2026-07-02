@@ -62,6 +62,15 @@ except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
     HAVE_TE_MXFP8TENSOR = False
 
+# Check if Transformer Engine has the Blockwise FP8 tensor class (Hopper/H100 blockwise recipe).
+try:
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+
+    HAVE_TE_BLOCKWISE_FP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # Float8BlockwiseQTensor not found
+    HAVE_TE_BLOCKWISE_FP8TENSOR = False
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
@@ -110,6 +119,11 @@ def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_MXFP8TENSOR and isinstance(tensor, MXFP8Tensor)
 
 
+def is_blockwise_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine Float8BlockwiseQTensor (blockwise fp8)."""
+    return HAVE_TE_BLOCKWISE_FP8TENSOR and isinstance(tensor, Float8BlockwiseQTensor)
+
+
 def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
     """Dequantize a fp8 tensor to a higher precision tensor."""
     if is_te_min_version("2.0"):
@@ -141,6 +155,36 @@ def _stage_param_to_bf16(p: torch.Tensor) -> torch.Tensor:
     if is_float8tensor(p):
         return dequantize_fp8_tensor(p).detach().to(torch.bfloat16)
     return p.detach().to(torch.bfloat16)
+
+
+def blockwise_fp8_direct_gather_supported(params: List[torch.Tensor]) -> bool:
+    """Whether a param-gather buffer can transport raw fp8 rowwise data instead of bf16.
+
+    Only blockwise fp8 params can be gathered as their quantized ``_rowwise_data`` +
+    ``_rowwise_scale_inv``: columnwise is rebuilt losslessly by ``post_all_gather_processing``
+    as a pure transpose of those two tensors (no amax/scale recompute). mxfp8 columnwise cannot
+    be derived from rowwise, and bf16 params have no fp8 storage, so a buffer must be *entirely*
+    blockwise fp8 to take this path; anything else falls back to bf16 staging. The predicate is a
+    pure function of the (identical across ranks) param objects, so every rank agrees on the
+    transport and the collectives stay in lockstep.
+    """
+    return len(params) > 0 and all(is_blockwise_float8tensor(p) for p in params)
+
+
+def get_blockwise_fp8_rowwise_tensors(p: torch.Tensor):
+    """Return a blockwise fp8 param's ``(rowwise uint8 data, rowwise fp32 scale_inv)`` storage."""
+    return p._rowwise_data, p._rowwise_scale_inv
+
+
+def copy_gathered_blockwise_fp8_into_param(
+    p: torch.Tensor, rowwise_data: torch.Tensor, rowwise_scale_inv: torch.Tensor
+) -> None:
+    """Non-owner side: install gathered rowwise fp8 data + scale_inv into a blockwise fp8 param.
+
+    Columnwise/transpose is rebuilt afterwards by ``post_all_gather_processing`` (pure transpose).
+    """
+    p._rowwise_data.copy_(rowwise_data)
+    p._rowwise_scale_inv.copy_(rowwise_scale_inv)
 
 
 def _resolve_callable_from_python_import_path(dotted_path: str):

@@ -24,7 +24,10 @@ from megatron.core.utils import log_single_rank
 from ..fp4_utils import get_nvfp4_rowwise_packed_shape, is_nvfp4tensor
 from ..fp8_utils import (
     _stage_param_to_bf16,
+    blockwise_fp8_direct_gather_supported,
     copy_back_gathered_bf16_into_fp8_param,
+    copy_gathered_blockwise_fp8_into_param,
+    get_blockwise_fp8_rowwise_tensors,
     is_float8tensor,
     is_mxfp8tensor,
     modify_underlying_storage,
@@ -124,6 +127,8 @@ class _ParamAndGradBucket:
         # Layer-wise optimizer attributes for async param gather.
         self.layerwise_params_list = None
         self.layerwise_param_flat_sizes = None
+        # For blockwise fp8 rowwise-direct gather this carries a packed uint8 payload
+        # ([rowwise data][scale_inv bytes]) per rank; otherwise the bf16/plain gather slots.
         self.layerwise_gather_list = None
 
     def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
@@ -158,17 +163,43 @@ class _LayerwiseAllGatherHandle:
 
 
 @torch.no_grad()
-def _layerwise_copy_back_gathered_params(bucket, local_rank: int, fp8_staged: bool = False) -> None:
+def _layerwise_copy_back_gathered_params(
+    bucket, local_rank: int, fp8_staged: bool = False, blockwise_direct: bool = False
+) -> None:
     """Copy each rank's gathered params from the bucket gather slots into model params (non-DistOpt
-    LayerWise overlap path). ``fp8_staged`` MUST match ``start_param_sync``'s staging decision.
+    LayerWise overlap path). The mode flags MUST match ``start_param_sync``'s staging decision.
 
-    * bf16 (``fp8_staged=False``): unflatten against the params, ``copy_`` into non-owned
-      ``model_p.data`` (owned already hold the staged value).
-    * fp8 (``fp8_staged=True``): the all-gather rode bf16; requantize ALL ranks (owned included)
-      via ``copy_back_gathered_bf16_into_fp8_param`` so every owner holds ``Q(bf16(master))``.
+    * bf16 (``fp8_staged=False``, ``blockwise_direct=False``): unflatten against the params,
+      ``copy_`` into non-owned ``model_p.data`` (owned already hold the staged value).
+    * fp8 bf16-staged (``fp8_staged=True``): the all-gather rode bf16; requantize ALL ranks (owned
+      included) via ``copy_back_gathered_bf16_into_fp8_param`` so every owner holds
+      ``Q(bf16(master))``.
+    * fp8 blockwise-direct (``blockwise_direct=True``): the all-gather rode the owner's quantized
+      rowwise data + scale_inv; install both into non-owned params (the owner's own storage was
+      already quantized by the optimizer step's copy-back). Columnwise is rebuilt afterwards by
+      ``_post_param_sync`` -> ``post_all_gather_processing`` (a pure transpose for blockwise).
 
     no_grad: in-place copy_ on a leaf param trips autograd's in-place guard.
     """
+    if blockwise_direct:
+        # Each rank's slot is a packed uint8 payload: [rowwise data bytes][scale_inv bytes].
+        # Sizes are recomputed from the (cross-rank identical) params -- no stored state needed.
+        # scale_inv is rebuilt in a fresh fp32 tensor to avoid an unaligned in-place fp32 view.
+        for idx, params in enumerate(bucket.layerwise_params_list):
+            if len(params) == 0 or idx == local_rank:
+                continue
+            data_tmpls = [get_blockwise_fp8_rowwise_tensors(p)[0] for p in params]
+            scale_tmpls = [get_blockwise_fp8_rowwise_tensors(p)[1] for p in params]
+            d = sum(t.numel() for t in data_tmpls)
+            s = sum(t.numel() for t in scale_tmpls)
+            slot = bucket.layerwise_gather_list[idx]
+            scale_fp32 = torch.empty(s, dtype=torch.float32, device=slot.device)
+            scale_fp32.view(torch.uint8).copy_(slot[d : d + 4 * s])
+            gathered_data = _unflatten_dense_tensors(slot[:d], data_tmpls)
+            gathered_scale = _unflatten_dense_tensors(scale_fp32, scale_tmpls)
+            for model_p, g_data, g_scale in zip(params, gathered_data, gathered_scale):
+                copy_gathered_blockwise_fp8_into_param(model_p, g_data, g_scale)
+        return
     for idx, params in enumerate(bucket.layerwise_params_list):
         if len(params) == 0:
             continue
@@ -451,20 +482,79 @@ class _ParamAndGradBucketGroup:
                     and bucket.params_list
                     and any(is_float8tensor(p) for p in bucket.params_list)
                 )
-                # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
-                # (~2x less comm) + its small scale_inv and rebuild columnwise via transpose
-                # (Adam/DistOpt-style), instead of bf16. mxfp8 must stay on bf16: its row/col block
-                # scales cannot be derived from one another.
-                #
+                # Blockwise fp8 buckets gather the owner's quantized rowwise data (~2x less comm
+                # than bf16) + the small per-block scale_inv, then rebuild columnwise as a transpose
+                # in _post_param_sync (Adam/DistOpt-style). mxfp8 must stay on bf16 (its row/col
+                # block scales are not derivable from one another), and a mixed fp8+bf16 bucket has
+                # no uniform fp8 storage, so both keep the bf16-staged transport. The predicate is a
+                # pure function of the (cross-rank identical) params, keeping collectives in step.
+                bucket_is_blockwise_fp8 = bucket_is_fp8 and blockwise_fp8_direct_gather_supported(
+                    bucket.params_list
+                )
                 # Persist the staging decision so the copy-back (sync here, overlap in
                 # finish_param_sync) uses the same signal, keeping transport and copy-back in sync.
-                bucket.layerwise_fp8_staged = bucket_is_fp8
-                # Transport dtype: bf16 for decouple fp8 param-gather; else the param's own dtype.
-                param_dtype = torch.bfloat16 if bucket_is_fp8 else bucket.params_list[0].dtype
+                bucket.layerwise_blockwise_direct = bucket_is_blockwise_fp8
+                bucket.layerwise_fp8_staged = bucket_is_fp8 and not bucket_is_blockwise_fp8
 
                 if max(bucket.layerwise_param_flat_sizes) == 0:
                     bucket.layerwise_gather_list = None
                     continue
+
+                if bucket_is_blockwise_fp8:
+                    # The owner's fp8 rowwise storage is already current from the optimizer step's
+                    # copy-back (blockwise params are untagged, so the step quantizes
+                    # Q(bf16(master))). Just read (rowwise data, rowwise scale_inv) here -- doing the
+                    # quantize inside start_param_sync would sync against the in-flight param
+                    # all-gather and deadlock. Whole-param ownership makes the per-block quant local,
+                    # so this is bitwise-equal to the bf16-staged path.
+                    owned_data, owned_scale = [], []
+                    for p in bucket.layerwise_params_list[local_rank]:
+                        d, s = get_blockwise_fp8_rowwise_tensors(p)
+                        owned_data.append(d)
+                        owned_scale.append(s)
+
+                    # Pack each rank's rowwise data + per-block scale_inv into ONE uint8 payload and
+                    # do a single uneven all-gather -- exactly one collective per bucket, matching
+                    # the bf16 path (two collectives per bucket desynchronize the overlap pipeline).
+                    # scale_inv (fp32) rides as raw bytes appended after the data; the receiver
+                    # rebuilds it in a fresh aligned fp32 tensor, so no in-place fp32 view is needed.
+                    data_sizes = [
+                        sum(get_blockwise_fp8_rowwise_tensors(p)[0].numel() for p in params)
+                        for params in bucket.layerwise_params_list
+                    ]
+                    scale_sizes = [
+                        sum(get_blockwise_fp8_rowwise_tensors(p)[1].numel() for p in params)
+                        for params in bucket.layerwise_params_list
+                    ]
+                    payload_sizes = [data_sizes[i] + 4 * scale_sizes[i] for i in range(dp_size)]
+
+                    # Payload reuses grad_data (viewed as bytes, idle during forward).
+                    reuse_u8 = bucket.grad_data.view(torch.uint8)
+                    assert reuse_u8.numel() >= sum(payload_sizes)
+                    gather_list = []
+                    offset = 0
+                    for i in range(dp_size):
+                        gather_list.append(reuse_u8[offset : offset + payload_sizes[i]])
+                        offset += payload_sizes[i]
+
+                    if payload_sizes[local_rank] > 0:
+                        slot = gather_list[local_rank]
+                        d = data_sizes[local_rank]
+                        if d > 0:
+                            slot[:d].copy_(_flatten_dense_tensors(owned_data))
+                        if scale_sizes[local_rank] > 0:
+                            slot[d:].copy_(_flatten_dense_tensors(owned_scale).view(torch.uint8))
+                    bucket.layerwise_gather_list = gather_list
+
+                    work = torch.distributed.all_gather(
+                        gather_list, gather_list[local_rank], group=group, async_op=async_op
+                    )
+                    if async_op and work is not None:
+                        layerwise_work_handles.append(work)
+                    continue
+
+                # Transport dtype: bf16 for decouple fp8 param-gather; else the param's own dtype.
+                param_dtype = torch.bfloat16 if bucket_is_fp8 else bucket.params_list[0].dtype
 
                 local_size = bucket.layerwise_param_flat_sizes[local_rank]
                 total_gather_size = sum(bucket.layerwise_param_flat_sizes)
@@ -518,6 +608,7 @@ class _ParamAndGradBucketGroup:
                         bucket,
                         local_rank,
                         fp8_staged=getattr(bucket, 'layerwise_fp8_staged', False),
+                        blockwise_direct=getattr(bucket, 'layerwise_blockwise_direct', False),
                     )
                     bucket.layerwise_gather_list = None
                     # Zero out grad_data since it was reused as the all-gather
@@ -605,6 +696,7 @@ class _ParamAndGradBucketGroup:
                         bucket,
                         self.intra_distributed_optimizer_instance_rank,
                         fp8_staged=getattr(bucket, 'layerwise_fp8_staged', False),
+                        blockwise_direct=getattr(bucket, 'layerwise_blockwise_direct', False),
                     )
                     bucket.layerwise_gather_list = None
                     # Zero out grad_data since it was reused as the all-gather
