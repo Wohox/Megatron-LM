@@ -874,6 +874,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
+    moe_use_mega_ep: bool = False
+    """[Experimental] Use the Triton-distributed Mega-EP (MegaMoE) fused expert-parallel
+    kernel via the standalone MegaMoELayer instead of the standard MoELayer. BF16-only,
+    gated SwiGLU experts, intra-node EP (ep_size <= 8). For functional verification."""
+
     moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 

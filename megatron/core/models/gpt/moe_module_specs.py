@@ -61,10 +61,26 @@ def get_moe_module_spec_for_backend(
     # shared experts spec
     shared_experts = partial(SharedExpertMLP, submodules=mlp)
 
-    # MoE module spec
-    return partial(
-        MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
-    )
+    submodules = MoESubmodules(experts=experts, shared_experts=shared_experts)
+
+    # MoE module spec. The builder selects MegaMoELayer at layer-construction time
+    # when config.moe_use_mega_ep is set, otherwise the standard MoELayer. The class
+    # choice is deferred to call time because the spec is built before the config is
+    # available in some flows.
+    return partial(_build_moe_layer, submodules=submodules)
+
+
+def _build_moe_layer(*args, submodules: MoESubmodules, **kwargs):
+    """MlpBuilder that dispatches to MegaMoELayer or MoELayer based on config."""
+    config = kwargs.get("config")
+    if config is None and args:
+        config = args[0]
+    if config is not None and getattr(config, "moe_use_mega_ep", False):
+        # Imported lazily so Megatron stays importable without Triton-distributed.
+        from megatron.core.transformer.moe.mega_moe_layer import MegaMoELayer
+
+        return MegaMoELayer(*args, submodules=submodules, **kwargs)
+    return MoELayer(*args, submodules=submodules, **kwargs)
 
 
 def get_inference_optimized_moe_spec() -> MlpBuilder:

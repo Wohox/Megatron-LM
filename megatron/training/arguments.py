@@ -4596,6 +4596,9 @@ def _add_moe_args(parser):
         help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
         'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.',
     )
+    # NOTE: --moe-use-mega-ep is auto-generated from the TransformerConfig
+    # `moe_use_mega_ep` field by the dataclass-driven ArgumentGroupFactory
+    # (megatron/training/argument_utils.py); no manual add_argument needed.
     return parser
 
 
