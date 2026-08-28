@@ -28,11 +28,13 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_shard_optimizer
 from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.ssm.mamba_mixer import HAVE_MAMBA_SSM
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 try:
     import causal_conv1d  # noqa: F401
@@ -59,13 +61,27 @@ NUM_STEPS = 3
 LR = 0.01
 
 
+def _mla_supported():
+    """MLA ('+') needs the glyph and the ``mla_layer`` spec slot, both of which ship on
+    ``main``; skip gracefully until this branch is rebased onto main."""
+    return (
+        getattr(LayerSymbols, "MLA", None) is not None
+        and getattr(getattr(hybrid_stack_spec, "submodules", None), "mla_layer", None) is not None
+    )
+
+
 def _hybrid_config(hybrid_layer_pattern, num_moe_experts=8, extra_kwargs=None):
     """Build a TransformerConfig usable by HybridModel + EP overlap."""
     extra_kwargs = dict(extra_kwargs or {})
+    config_cls = TransformerConfig
+    if "+" in hybrid_layer_pattern:
+        # MLA pre-layers: mirror the GPT-side a2a_overlap MLA config (default MLA dims).
+        config_cls = MLATransformerConfig
+        extra_kwargs.setdefault("multi_latent_attention", True)
     # HybridModel derives effective num_layers from the pattern; we still pass
     # the flattened count so TransformerConfig.__post_init__ checks pass.
     flat = hybrid_layer_pattern.replace("[", "").replace("]", "")
-    return TransformerConfig(
+    return config_cls(
         # ``deterministic_mode`` (utils.deterministic_mode) sets
         # ``NVTE_FUSED_ATTN=0`` for reproducibility; the default attention
         # backend ``auto`` asserts that env is unset, so pin it to ``unfused``
@@ -147,7 +163,7 @@ class TestFSDPHybridOverlap:
     )
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
-    @pytest.mark.parametrize("hybrid_layer_pattern", ["[*E][*E]", "[M*E][M*E]"])
+    @pytest.mark.parametrize("hybrid_layer_pattern", ["[*E][*E]", "[M*E][M*E]", "[+E][+E]"])
     def test_fsdp_hybrid_overlap_training_step(
         self, dispatcher_type, shared_expert_intermediate_size, hybrid_layer_pattern
     ):
@@ -155,6 +171,11 @@ class TestFSDPHybridOverlap:
             pytest.skip(
                 "Mamba pattern requires both mamba-ssm and causal-conv1d "
                 "(`pip install mamba-ssm causal-conv1d`)."
+            )
+        if "+" in hybrid_layer_pattern and not _mla_supported():
+            pytest.skip(
+                "MLA ('+') hybrid layers need the glyph and mla_layer spec from main; "
+                "this branch predates them."
             )
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":

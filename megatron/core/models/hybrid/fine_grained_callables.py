@@ -14,6 +14,22 @@ from megatron.core.models.common.utils import TransformerLayerNode, should_free_
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+
+# TransformerLayer-backed pre-dispatch families that share the attention-slot handling
+# (``_forward_attention`` forward + ``_BackwardDWWrapper`` wgrad coordination).
+# ``Symbols.MLA`` ('+') ships on ``main`` but not yet on this branch's base, so resolve it
+# at import time: the entry is a no-op until the branch is rebased onto main, after which
+# MLA pre-layers participate in the overlap like attention/DSA/GDN.
+_ATTENTION_LIKE_PRE_LAYER_SYMBOLS = tuple(
+    symbol
+    for symbol in (
+        LayerSymbols.ATTENTION,
+        LayerSymbols.DS_ATTENTION,
+        getattr(LayerSymbols, "MLA", None),
+        LayerSymbols.GDN,
+    )
+    if symbol is not None
+)
 from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -266,11 +282,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                         inference_context=getattr(node.chunk_state, "inference_context", None),
                         packed_seq_params=node.chunk_state.packed_seq_params,
                     )
-                elif item_type in (
-                    LayerSymbols.ATTENTION,
-                    LayerSymbols.DS_ATTENTION,
-                    LayerSymbols.GDN,
-                ):
+                elif item_type in _ATTENTION_LIKE_PRE_LAYER_SYMBOLS:
                     # Use _forward_attention rather than __call__: an attention half-layer has
                     # mlp=IdentityOp / mlp_bda=IdentityFuncOp by default, and TransformerLayer's
                     # __call__ would route through _forward_mlp + mlp_bda, double-applying the
@@ -357,7 +369,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
     backward_dw = {}
     pre_bwd_dw = []
     for item_type, item_layer in pre_layers:
-        if item_type in (LayerSymbols.ATTENTION, LayerSymbols.DS_ATTENTION, LayerSymbols.GDN):
+        if item_type in _ATTENTION_LIKE_PRE_LAYER_SYMBOLS:
             # TransformerLayer-backed pre-layers go through the standard
             # _BackwardDWWrapper which coordinates attn / shared-expert wgrad
             # with cuda-graph replay scopes.
