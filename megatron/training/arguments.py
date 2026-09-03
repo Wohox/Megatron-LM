@@ -1913,15 +1913,6 @@ def validate_args(args, defaults={}):
                 "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
                 "instance) would under-reduce Muon gradients across the full data-parallel domain."
             )
-        else:
-            # Padded LayerWise param layout: fp8/fp4 parameter gather is not supported here.
-            assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
-                "Layer-wise (Muon) distributed optimizer with the padded param layout does not "
-                "support FP8/FP4 parameter gather. Use the default compact decoupled layout (do "
-                "not pass --use-layer-wise-param-layout) for fp8 parameter gather, or "
-                "fp8_param_gather=False."
-            )
-
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
